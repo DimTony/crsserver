@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const createTransporter = () => {
   // Check if custom SMTP settings are provided
   if (process.env.SMTP_HOST) {
-    return nodemailer.createTransporter({
+    return nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: parseInt(process.env.SMTP_PORT) || 587,
       secure: process.env.SMTP_PORT === "465", // true for 465, false for other ports
@@ -19,7 +19,7 @@ const createTransporter = () => {
 
   // Gmail configuration (default)
   if (process.env.EMAIL_USER && process.env.EMAIL_APP_PASSWORD) {
-    return nodemailer.createTransporter({
+    return nodemailer.createTransport({
       service: "gmail",
       auth: {
         user: process.env.EMAIL_USER,
@@ -33,7 +33,7 @@ const createTransporter = () => {
     (process.env.EMAIL_USER && process.env.EMAIL_USER.includes("outlook")) ||
     process.env.EMAIL_USER.includes("hotmail")
   ) {
-    return nodemailer.createTransporter({
+    return nodemailer.createTransport({
       service: "hotmail",
       auth: {
         user: process.env.EMAIL_USER,

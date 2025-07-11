@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const http = require("http");
 const socketIo = require("socket.io");
 // const setupSocket = require("./utils/socketHandler");
@@ -36,7 +37,30 @@ const io = socketIo(server, {
 
 // Middleware
 app.use(express.json());
-app.use(cors());
+
+const allowedOrigins = [
+  "https://mock-kappa.vercel.app",
+  // "https://admin.yourdomain.com",
+  "http://localhost:3000", // for local development
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`Blocked CORS request from origin: ${origin}`);
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true, // optional, if you're using cookies or sessions
+};
+
+app.use(cors(corsOptions));
+app.use(helmet());
+
+
 app.use(logger("dev"));
 
 // Setup socket handlers
