@@ -1,4 +1,3 @@
-// controllers/authController.js
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const User = require("../models/user");
@@ -9,11 +8,6 @@ const {
   getSubscriptionPrice,
   getSubscriptionDuration,
 } = require("../utils/helpers");
-const {
-  generateVerificationToken,
-  sendVerificationEmail,
-  sendWelcomeEmail,
-} = require("../config/emailService");
 
 // Helper function to generate random string for TOTP secret
 const generateRandomString = (length) => {
@@ -59,6 +53,10 @@ const register = async (req, res, next) => {
       throw new CustomError(400, "Please provide a valid email address");
     }
 
+    // if (!imeiRegex.test(imei)) {
+    //   throw new CustomError(400, "Please provide a valid IMEI");
+    // }
+
     if (!phoneNumberRegex.test(phoneNumber)) {
       throw new CustomError(400, "Please provide a valid phone number");
     }
@@ -86,40 +84,11 @@ const register = async (req, res, next) => {
     const existingUserByEmail = await User.findOne({ email });
     const existingUserByUsername = await User.findOne({ username });
 
-    if (existingUserByEmail) {
-      // If user exists but email not verified, we can allow re-registration
-      if (!existingUserByEmail.isEmailVerified) {
-        // Generate new verification token and resend email
-        const verificationToken =
-          existingUserByEmail.generateVerificationToken();
-        await existingUserByEmail.save();
-
-        try {
-          await sendVerificationEmail(email, verificationToken, username);
-        } catch (emailError) {
-          console.error("Failed to send verification email:", emailError);
-          // Continue with registration even if email fails
-        }
-
-        return res.status(200).json({
-          success: true,
-          message:
-            "Account already exists but email not verified. New verification email sent.",
-          data: {
-            requiresVerification: true,
-            email: existingUserByEmail.email,
-          },
-        });
-      }
-
+    if (existingUserByEmail || existingUserByUsername) {
       throw new CustomError(
         400,
-        "User with this email already exists and is verified"
+        "User with this email or username already exists"
       );
-    }
-
-    if (existingUserByUsername) {
-      throw new CustomError(400, "Username already taken");
     }
 
     // Check if device already exists
@@ -141,22 +110,14 @@ const register = async (req, res, next) => {
     }
 
     // Hash password
-    const salt = await bcrypt.genSalt(12);
+    const salt = await bcrypt.genSalt(12); // Increased salt rounds for better security
     const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Generate email verification token
-    const verificationToken = generateVerificationToken();
 
     // Create new user
     const newUser = new User({
       username,
       email,
       password: hashedPassword,
-      // Email verification fields
-      isEmailVerified: false,
-      isActive: false,
-      emailVerificationToken: verificationToken,
-      emailVerificationExpires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
     });
 
     await newUser.save();
@@ -172,7 +133,7 @@ const register = async (req, res, next) => {
       deviceName,
     });
 
-    await newDevice.save();
+    await newDevice.save(); // Save the device
 
     // Calculate subscription details
     const subscriptionPrice = getSubscriptionPrice(plan);
@@ -191,33 +152,66 @@ const register = async (req, res, next) => {
       plan,
       price: subscriptionPrice,
       cards: files,
-      startDate,
-      endDate,
+      startDate, // Set start date directly
+      endDate, // Set end date directly
       status: "PENDING",
     });
 
-    await newSubscription.save();
+    await newSubscription.save(); // Save the subscription
 
-    // Send verification email
-    try {
-      await sendVerificationEmail(email, verificationToken, username);
-      console.log(`✅ Verification email sent to ${email}`);
-    } catch (emailError) {
-      console.error("Failed to send verification email:", emailError);
-      // Continue with registration even if email fails
-    }
+    // Prepare user response (without password)
+    const userResponse = newUser.toObject();
+    delete userResponse.password;
 
-    // Send success response (don't include tokens until verified)
+    // Create JWT payload
+    const payload = {
+      user: {
+        id: newUser.id,
+        // email: newUser.email,
+        // username: newUser.username,
+      },
+    };
+
+    // Sign token using Promise instead of callback
+    const token = jwt.sign(
+      payload,
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" } // Extended token validity
+    );
+
+    const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: "1h",
+    });
+
+    const refreshToken = jwt.sign(payload, process.env.REFRESH_SECRET, {
+      expiresIn: "30d",
+    });
+
+    // Send success response
     res.status(201).json({
       success: true,
-      message:
-        "User registered successfully. Please check your email to verify your account.",
+      message: "User registered successfully",
       data: {
-        requiresVerification: true,
-        email: newUser.email,
-        username: newUser.username,
-        message:
-          "A verification email has been sent to your email address. Please click the link in the email to verify your account before logging in.",
+        ...userResponse,
+        accessToken,
+        refreshToken,
+        // token,
+        // user: userResponse,
+        // device: {
+        //   id: newDevice._id,
+        //   imei: newDevice.imei,
+        //   deviceName: newDevice.deviceName,
+        //   isOnboarded: newDevice.isOnboarded || false,
+        // },
+        // subscription: {
+        //   id: newSubscription._id,
+        //   plan: newSubscription.plan,
+        //   price: newSubscription.price,
+        //   status: newSubscription.status,
+        //   startDate: newSubscription.startDate,
+        //   endDate: newSubscription.endDate,
+        //   filesCount: files.length,
+        // },
       },
     });
   } catch (err) {
@@ -226,9 +220,11 @@ const register = async (req, res, next) => {
     if (err instanceof CustomError) {
       next(err);
     } else if (err.code === 11000) {
+      // MongoDB duplicate key error
       const field = Object.keys(err.keyPattern)[0];
       next(new CustomError(400, `${field} already exists`));
     } else if (err.name === "ValidationError") {
+      // Mongoose validation error
       const messages = Object.values(err.errors).map((e) => e.message);
       next(new CustomError(400, messages.join(", ")));
     } else {
@@ -238,6 +234,8 @@ const register = async (req, res, next) => {
 };
 
 const login = async (req, res, next) => {
+  // console.log("[LOGIN SERVER]:", req.body);
+
   const { username, password } = req.body;
 
   try {
@@ -250,38 +248,11 @@ const login = async (req, res, next) => {
       throw new CustomError(401, "Invalid credentials");
     }
 
-    // Check if email is verified
-    if (!user.isEmailVerified) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Please verify your email address before logging in. Check your inbox for the verification link.",
-        data: {
-          requiresVerification: true,
-          email: user.email,
-        },
-      });
-    }
-
-    // Check if account is active
-    if (!user.isActive) {
-      throw new CustomError(
-        403,
-        "Account is not active. Please contact support."
-      );
-    }
-
     // Compare passwords
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       throw new CustomError(401, "Invalid credentials");
     }
-
-    // Update login tracking
-    user.lastLoginAt = new Date();
-    user.isOnline = true;
-    user.lastSeen = new Date();
-    await user.save();
 
     // Create payload for JWT
     const payload = {
@@ -290,7 +261,7 @@ const login = async (req, res, next) => {
       },
     };
 
-    // Sign tokens
+    // Sign token
     const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
       expiresIn: "1h",
     });
@@ -301,8 +272,6 @@ const login = async (req, res, next) => {
 
     const userResponse = user.toObject();
     delete userResponse.password;
-    delete userResponse.emailVerificationToken;
-    delete userResponse.emailVerificationExpires;
 
     // Send response with token and user info
     res.json({
@@ -313,96 +282,35 @@ const login = async (req, res, next) => {
         accessToken,
         refreshToken,
       },
+      // token,
+      // user: userResponse,
     });
-  } catch (err) {
-    next(err);
-  }
-};
 
-// Email verification endpoint
-const verifyEmail = async (req, res, next) => {
-  try {
-    const { token } = req.query;
+    // (err, token) => {
+    //   if (err) throw err;
 
-    if (!token) {
-      throw new CustomError(400, "Verification token is required");
-    }
+    //   // Filter out password from user object
+    // const userResponse = user.toObject();
+    // delete userResponse.password;
 
-    // Find user by valid verification token
-    const user = await User.findByValidVerificationToken(token);
-
-    if (!user) {
-      throw new CustomError(400, "Invalid or expired verification token");
-    }
-
-    // Activate user account
-    await user.activateAccount();
-
-    // Send welcome email
-    try {
-      await sendWelcomeEmail(user.email, user.username);
-    } catch (emailError) {
-      console.error("Failed to send welcome email:", emailError);
-      // Don't fail the verification if welcome email fails
-    }
-
-    res.json({
-      success: true,
-      message: "Email verified successfully! Your account is now active.",
-      data: {
-        verified: true,
-        email: user.email,
-        username: user.username,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// Resend verification email
-const resendVerificationEmail = async (req, res, next) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      throw new CustomError(400, "Email is required");
-    }
-
-    const user = await User.findOne({ email });
-
-    if (!user) {
-      throw new CustomError(404, "User not found");
-    }
-
-    if (user.isEmailVerified) {
-      throw new CustomError(400, "Email is already verified");
-    }
-
-    // Generate new verification token
-    const verificationToken = user.generateVerificationToken();
-    await user.save();
-
-    // Send verification email
-    await sendVerificationEmail(email, verificationToken, user.username);
-
-    res.json({
-      success: true,
-      message: "Verification email sent successfully",
-      data: {
-        email: user.email,
-      },
-    });
+    // // Send response with token and user info
+    // res.json({
+    //   message: "Login successful",
+    //   token,
+    //   user: userResponse,
+    // });
+    // }
+    // );
   } catch (err) {
     next(err);
   }
 };
 
 const getUser = async (req, res, next) => {
+  // console.log("[getUser SERVER]:", req.user);
+
   try {
-    const user = await User.findById(req.user._id).select(
-      "-password -emailVerificationToken"
-    );
+    const user = await User.findById(req.user._id).select("-password");
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -411,6 +319,8 @@ const getUser = async (req, res, next) => {
     }
 
     const devices = await Device.find({ user: req.user._id });
+
+    // Get user's subscriptions
     const subscriptions = await Subscription.find({ user: req.user._id });
 
     res.json({
@@ -429,6 +339,8 @@ const getUser = async (req, res, next) => {
 
 const passUser = async (req, res, next) => {
   try {
+    // console.log("uuu", req.user);
+    // const user = await User.findById(req.user.id).select("-password");
     const user = req.user;
 
     if (!user) {
@@ -441,6 +353,7 @@ const passUser = async (req, res, next) => {
       },
     };
 
+    // Sign token
     jwt.sign(
       payload,
       process.env.JWT_SECRET,
@@ -448,6 +361,11 @@ const passUser = async (req, res, next) => {
       (err, token) => {
         if (err) throw err;
 
+        // Filter out password from user object
+        // const userResponse = user.toObject();
+        // delete userResponse.password;
+
+        // Send response with token and user info
         res.json({
           message: "Authentication successful",
           token,
@@ -455,6 +373,7 @@ const passUser = async (req, res, next) => {
         });
       }
     );
+    // res.json(user);
   } catch (err) {
     next(err);
   }
@@ -462,26 +381,15 @@ const passUser = async (req, res, next) => {
 
 const logout = async (req, res, next) => {
   try {
-    // Update user status if user is authenticated
-    if (req.user) {
-      await User.findByIdAndUpdate(req.user._id, {
-        isOnline: false,
-        lastSeen: new Date(),
-      });
-    }
+    // console.log("uuu", req.user);
+    // const user = await User.findById(req.user.id).select("-password");
 
-    res.json({ success: true, message: "Logged out successfully" });
+    // Sign token
+
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }
 };
 
-module.exports = {
-  login,
-  register,
-  verifyEmail,
-  resendVerificationEmail,
-  getUser,
-  passUser,
-  logout,
-};
+module.exports = { login, register, getUser, passUser, logout };
