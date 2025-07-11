@@ -1,3 +1,4 @@
+// controllers/authController.js - Updated with Transaction Logging
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
@@ -5,6 +6,7 @@ const mongoose = require("mongoose");
 const User = require("../models/user");
 const Device = require("../models/device");
 const Subscription = require("../models/subscription");
+const Transaction = require("../models/transaction"); // Add this import
 const CustomError = require("../utils/customError");
 const {
   getSubscriptionPrice,
@@ -16,6 +18,12 @@ const {
   sendWelcomeEmail,
   sendSubscriptionQueuedEmail,
 } = require("../config/emailService");
+
+// Helper function to extract request metadata
+const extractRequestMetadata = (req) => ({
+  userAgent: req.get("User-Agent") || "Unknown",
+  ipAddress: req.ip || req.connection.remoteAddress || "Unknown",
+});
 
 // Helper function to generate random string for TOTP secret
 const generateRandomString = (length) => {
@@ -45,6 +53,9 @@ const register = async (req, res, next) => {
     files,
     submissionNotes,
   } = req.body;
+
+  // Extract request metadata for transaction logging
+  const requestMetadata = extractRequestMetadata(req);
 
   // Start a database session for transaction
   const session = await mongoose.startSession();
@@ -188,7 +199,7 @@ const register = async (req, res, next) => {
     // Generate email verification token
     const verificationToken = generateVerificationToken();
 
-    let newUser, device, newSubscription;
+    let newUser, device, newSubscription, transaction;
 
     // Create new user within transaction
     newUser = new User({
@@ -269,6 +280,40 @@ const register = async (req, res, next) => {
       `✅ Subscription created with PENDING status: ${newSubscription._id}`
     );
 
+    // **NEW: Create transaction record**
+    try {
+      transaction = await Transaction.createSubscriptionTransaction({
+        user: newUser._id.toString(),
+        _id: newSubscription._id,
+        device: device._id,
+        price: subscriptionPrice,
+        plan,
+        imei,
+        deviceName,
+        phone: phoneNumber,
+        email,
+        cards: files,
+        queuePosition,
+        submissionNotes,
+        createdAt: new Date(),
+      });
+
+      // Add request metadata to transaction
+      transaction.metadata = {
+        ...transaction.metadata,
+        ...requestMetadata,
+      };
+
+      await transaction.save({ session });
+      console.log(
+        `✅ Transaction record created: ${transaction.transactionId}`
+      );
+    } catch (transactionError) {
+      console.error("Failed to create transaction record:", transactionError);
+      // Don't fail the registration for transaction logging errors
+      // but log the error for investigation
+    }
+
     // Commit transaction - all operations succeeded
     await session.commitTransaction();
     console.log("✅ Transaction committed successfully");
@@ -309,6 +354,14 @@ const register = async (req, res, next) => {
         deviceName: device.deviceName,
         isExisting: !!existingDevice,
       },
+      transaction: transaction
+        ? {
+            id: transaction._id,
+            transactionId: transaction.transactionId,
+            amount: transaction.amount,
+            status: transaction.status,
+          }
+        : null,
       message: emailSent
         ? "Registration successful! Please verify your email and your subscription request has been queued for admin review."
         : "Registration successful! Please contact support to verify your account. Your subscription request has been queued for admin review.",
@@ -368,6 +421,205 @@ const register = async (req, res, next) => {
     await session.endSession();
   }
 };
+
+// Helper function to log transaction status updates
+const logTransactionUpdate = async (
+  subscriptionId,
+  type,
+  status,
+  adminId = null,
+  additionalData = {}
+) => {
+  try {
+    // Find existing transaction for this subscription
+    const existingTransaction = await Transaction.findOne({
+      subscription: subscriptionId,
+      type: "SUBSCRIPTION_CREATED",
+    });
+
+    if (existingTransaction) {
+      // Update existing transaction
+      const updateData = {
+        type: type,
+        status: status,
+        ...additionalData,
+      };
+
+      if (adminId) {
+        await existingTransaction.processedByAdmin(
+          adminId,
+          additionalData.adminNotes || ""
+        );
+      }
+
+      await existingTransaction.updateStatus(status, updateData);
+      console.log(
+        `✅ Transaction updated: ${existingTransaction.transactionId}`
+      );
+      return existingTransaction;
+    } else {
+      console.warn(
+        `⚠️ No transaction found for subscription: ${subscriptionId}`
+      );
+      return null;
+    }
+  } catch (error) {
+    console.error("Failed to log transaction update:", error);
+    return null;
+  }
+};
+
+// Updated subscription status update method (for admin actions)
+const updateSubscriptionStatus = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const { status, adminNotes } = req.body;
+    const adminId = req.user._id;
+    const requestMetadata = extractRequestMetadata(req);
+
+    // Validate status
+    const validStatuses = ["PENDING", "ACTIVE", "EXPIRED", "CANCELLED"];
+    if (!validStatuses.includes(status)) {
+      throw new CustomError(400, "Invalid status");
+    }
+
+    const subscription = await Subscription.findById(subscriptionId).populate(
+      "user",
+      "email username"
+    );
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    const session = await mongoose.startSession();
+    await session.startTransaction();
+
+    try {
+      // Update subscription status
+      const oldStatus = subscription.status;
+      subscription.status = status;
+
+      if (status === "ACTIVE") {
+        // Set start and end dates when activating
+        const subscriptionDuration = getSubscriptionDuration(subscription.plan);
+        subscription.startDate = new Date();
+        subscription.endDate = new Date(
+          Date.now() + subscriptionDuration * 24 * 60 * 60 * 1000
+        );
+
+        // Check if there's already an active subscription for this device
+        const existingActive = await Subscription.findOne({
+          imei: subscription.imei,
+          status: "ACTIVE",
+          _id: { $ne: subscriptionId },
+        }).session(session);
+
+        if (existingActive) {
+          await session.abortTransaction();
+          throw new CustomError(
+            400,
+            "Device already has an active subscription"
+          );
+        }
+      } else if (status === "CANCELLED" || status === "EXPIRED") {
+        // Clear dates when cancelling or expiring
+        if (status === "EXPIRED" && !subscription.endDate) {
+          subscription.endDate = new Date();
+        }
+      }
+
+      // Add admin notes and tracking
+      if (adminNotes) {
+        subscription.adminNotes = adminNotes;
+      }
+      subscription.reviewedBy = adminId;
+      subscription.reviewedAt = new Date();
+
+      await subscription.save({ session });
+
+      // **NEW: Log transaction update**
+      let transactionType = "SUBSCRIPTION_ACTIVATED";
+      let transactionStatus = "COMPLETED";
+
+      if (status === "ACTIVE") {
+        transactionType = "SUBSCRIPTION_ACTIVATED";
+        transactionStatus = "COMPLETED";
+      } else if (status === "CANCELLED") {
+        transactionType = "SUBSCRIPTION_CANCELLED";
+        transactionStatus = "CANCELLED";
+      } else if (status === "EXPIRED") {
+        transactionType = "SUBSCRIPTION_EXPIRED";
+        transactionStatus = "COMPLETED";
+      }
+
+      await logTransactionUpdate(
+        subscriptionId,
+        transactionType,
+        transactionStatus,
+        adminId,
+        {
+          adminNotes,
+          subscriptionPeriod: {
+            startDate: subscription.startDate,
+            endDate: subscription.endDate,
+          },
+          metadata: {
+            ...requestMetadata,
+            statusChange: {
+              from: oldStatus,
+              to: status,
+              changedAt: new Date(),
+            },
+          },
+        }
+      );
+
+      // If activating, recalculate queue positions for remaining pending subscriptions
+      if (status === "ACTIVE") {
+        const pendingSubscriptions = await Subscription.find({
+          imei: subscription.imei,
+          status: "PENDING",
+          _id: { $ne: subscriptionId },
+        })
+          .sort({ queuePosition: 1, createdAt: 1 })
+          .session(session);
+
+        // Update queue positions
+        for (let i = 0; i < pendingSubscriptions.length; i++) {
+          pendingSubscriptions[i].queuePosition = (i + 1).toString();
+          await pendingSubscriptions[i].save({ session });
+        }
+      }
+
+      await session.commitTransaction();
+
+      res.json({
+        success: true,
+        message: `Subscription ${status.toLowerCase()} successfully`,
+        data: {
+          subscriptionId: subscription._id,
+          status: subscription.status,
+          user: subscription.user,
+          imei: subscription.imei,
+          plan: subscription.plan,
+          startDate: subscription.startDate,
+          endDate: subscription.endDate,
+        },
+      });
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+
 
 // Get user's subscription status
 const getSubscriptionStatus = async (req, res, next) => {
@@ -448,119 +700,6 @@ const getDeviceQueueStatus = async (req, res, next) => {
   }
 };
 
-// Admin method to approve/reject subscription requests
-const updateSubscriptionStatus = async (req, res, next) => {
-  try {
-    const { subscriptionId } = req.params;
-    const { status, adminNotes } = req.body;
-    const adminId = req.user._id;
-
-    // Validate status
-    const validStatuses = ["PENDING", "ACTIVE", "EXPIRED", "CANCELLED"];
-    if (!validStatuses.includes(status)) {
-      throw new CustomError(400, "Invalid status");
-    }
-
-    const subscription = await Subscription.findById(subscriptionId).populate(
-      "user",
-      "email username"
-    );
-
-    if (!subscription) {
-      throw new CustomError(404, "Subscription not found");
-    }
-
-    const session = await mongoose.startSession();
-    await session.startTransaction();
-
-    try {
-      // Update subscription status
-      subscription.status = status;
-
-      if (status === "ACTIVE") {
-        // Set start and end dates when activating
-        const subscriptionDuration = getSubscriptionDuration(subscription.plan);
-        subscription.startDate = new Date();
-        subscription.endDate = new Date(
-          Date.now() + subscriptionDuration * 24 * 60 * 60 * 1000
-        );
-
-        // Check if there's already an active subscription for this device
-        const existingActive = await Subscription.findOne({
-          imei: subscription.imei,
-          status: "ACTIVE",
-          _id: { $ne: subscriptionId },
-        }).session(session);
-
-        if (existingActive) {
-          await session.abortTransaction();
-          throw new CustomError(
-            400,
-            "Device already has an active subscription"
-          );
-        }
-      } else if (status === "CANCELLED" || status === "EXPIRED") {
-        // Clear dates when cancelling or expiring
-        if (status === "EXPIRED" && !subscription.endDate) {
-          subscription.endDate = new Date();
-        }
-      }
-
-      // Add admin notes and tracking
-      if (adminNotes) {
-        subscription.adminNotes = adminNotes;
-      }
-      subscription.reviewedBy = adminId;
-      subscription.reviewedAt = new Date();
-
-      await subscription.save({ session });
-
-      // If activating, recalculate queue positions for remaining pending subscriptions
-      if (status === "ACTIVE") {
-        const pendingSubscriptions = await Subscription.find({
-          imei: subscription.imei,
-          status: "PENDING",
-          _id: { $ne: subscriptionId },
-        })
-          .sort({ queuePosition: 1, createdAt: 1 })
-          .session(session);
-
-        // Update queue positions
-        for (let i = 0; i < pendingSubscriptions.length; i++) {
-          pendingSubscriptions[i].queuePosition = (i + 1).toString();
-          await pendingSubscriptions[i].save({ session });
-        }
-      }
-
-      await session.commitTransaction();
-
-      // Send notification email to user based on status
-      // ... implement email notification logic
-
-      res.json({
-        success: true,
-        message: `Subscription ${status.toLowerCase()} successfully`,
-        data: {
-          subscriptionId: subscription._id,
-          status: subscription.status,
-          user: subscription.user,
-          imei: subscription.imei,
-          plan: subscription.plan,
-          startDate: subscription.startDate,
-          endDate: subscription.endDate,
-        },
-      });
-    } catch (error) {
-      await session.abortTransaction();
-      throw error;
-    } finally {
-      await session.endSession();
-    }
-  } catch (err) {
-    next(err);
-  }
-};
-
 // Cancel user's own subscription
 const cancelSubscription = async (req, res, next) => {
   try {
@@ -611,7 +750,6 @@ const hasActiveSubscription = async (phoneNumber, options = {}) => {
     options
   );
 };
-
 
 // Activate approved subscription with authenticator
 const activateSubscription = async (req, res, next) => {
@@ -974,7 +1112,6 @@ const getUser = async (req, res, next) => {
   }
 };
 
-
 const passUser = async (req, res, next) => {
   try {
     const user = req.user;
@@ -1032,6 +1169,8 @@ const logout = async (req, res, next) => {
 module.exports = {
   login,
   register,
+  updateSubscriptionStatus,
+  logTransactionUpdate,
   getSubscriptionStatus,
   activateSubscription,
   verifyEmail,
