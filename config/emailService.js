@@ -531,6 +531,364 @@ const testEmailConfiguration = async () => {
   }
 };
 
+const sendSubscriptionQueuedEmail = async (
+  email,
+  username,
+  plan,
+  queuePosition
+) => {
+  try {
+    console.log(`📧 Preparing subscription queued email for ${email}...`);
+
+    const transporter = createTransporter();
+    const dashboardUrl = `${process.env.FRONTEND_URL}/dashboard`;
+
+    const emailContent = `
+        <h2>Hi ${username}! 📋</h2>
+        <div class="alert alert-success">
+          <p><strong>✅ Subscription Request Submitted Successfully!</strong></p>
+        </div>
+        <p>Thank you for submitting your <strong>${plan}</strong> subscription request. Your application has been received and is now in our review queue.</p>
+        
+        <div class="alert">
+          <p><strong>📍 Your Queue Position:</strong> #${queuePosition}</p>
+          <p><strong>⏱️ Estimated Review Time:</strong> 2-3 business days</p>
+        </div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">📋 What Happens Next?</h3>
+        <ul class="feature-list">
+          <li><strong>Document Review</strong> - Our team will review your uploaded encryption cards</li>
+          <li><strong>Verification Process</strong> - We'll verify your account details and subscription requirements</li>
+          <li><strong>Approval Notification</strong> - You'll receive an email when your subscription is approved</li>
+          <li><strong>Activation Setup</strong> - Set up your authenticator and activate your subscription</li>
+        </ul>
+        
+        <div class="divider"></div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">📱 Required for Activation</h3>
+        <p>Once approved, you'll need to set up one of these authenticators to activate your subscription:</p>
+        <ul class="feature-list">
+          <li><strong>Google Authenticator</strong> - Free mobile app</li>
+          <li><strong>Microsoft Authenticator</strong> - Enterprise-grade security</li>
+          <li><strong>Entrust IdentityGuard</strong> - Professional authentication</li>
+        </ul>
+        
+        <p><strong>Important:</strong> Please ensure your email address is verified before your subscription is approved. Check your inbox for the email verification link if you haven't already confirmed your email.</p>
+        
+        <p>You can check the status of your subscription request anytime in your dashboard.</p>
+      `;
+
+    const htmlContent = createEmailTemplate(
+      "Subscription Request Queued - CRS Platform",
+      emailContent,
+      dashboardUrl,
+      "View Dashboard"
+    );
+
+    const textContent = `
+  Subscription Request Submitted - CRS Platform
+  
+  Hi ${username},
+  
+  Thank you for submitting your ${plan} subscription request. Your application has been received and is now in our review queue.
+  
+  Queue Position: #${queuePosition}
+  Estimated Review Time: 2-3 business days
+  
+  What Happens Next:
+  • Document Review - Our team will review your uploaded encryption cards
+  • Verification Process - We'll verify your account details and subscription requirements  
+  • Approval Notification - You'll receive an email when your subscription is approved
+  • Activation Setup - Set up your authenticator and activate your subscription
+  
+  Required for Activation:
+  Once approved, you'll need to set up one of these authenticators:
+  • Google Authenticator - Free mobile app
+  • Microsoft Authenticator - Enterprise-grade security
+  • Entrust IdentityGuard - Professional authentication
+  
+  Important: Please ensure your email address is verified before your subscription is approved.
+  
+  You can check the status of your subscription request anytime in your dashboard: ${dashboardUrl}
+  
+  Best regards,
+  The CRS Platform Team
+  
+  ---
+  CRS Platform - Secure Communication Solutions
+      `;
+
+    const mailOptions = {
+      from: {
+        name: "CRS Platform",
+        address: process.env.EMAIL_USER,
+      },
+      to: email,
+      subject: "Subscription Request Received - CRS Platform",
+      html: htmlContent,
+      text: textContent,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ Subscription queued email sent successfully to ${email}`);
+
+    return {
+      success: true,
+      messageId: info.messageId,
+      email: email,
+    };
+  } catch (error) {
+    console.error("❌ Error sending subscription queued email:", error);
+    throw new Error(
+      `Failed to send subscription queued email: ${error.message}`
+    );
+  }
+};
+
+// Send subscription approved email
+const sendSubscriptionApprovedEmail = async (
+  email,
+  username,
+  plan,
+  activationToken
+) => {
+  try {
+    console.log(`🎉 Preparing subscription approved email for ${email}...`);
+
+    const transporter = createTransporter();
+    const activationUrl = `${process.env.FRONTEND_URL}/activate-subscription?token=${activationToken}`;
+
+    const emailContent = `
+        <h2>Hi ${username}! 🎉</h2>
+        <div class="alert alert-success">
+          <p><strong>✅ Subscription Approved!</strong> Your ${plan} subscription has been approved by our admin team.</p>
+        </div>
+        <p>Great news! Your subscription request has been reviewed and approved. You can now activate your subscription to start using CRS Platform's secure communication features.</p>
+        
+        <div class="alert">
+          <p><strong>⏰ Important:</strong> You have 7 days to activate your subscription using the link below.</p>
+        </div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">🔐 Activation Requirements</h3>
+        <p>Before clicking the activation link, please ensure you have one of these authenticators ready:</p>
+        <ul class="feature-list">
+          <li><strong>Google Authenticator</strong> - Download from App Store/Google Play</li>
+          <li><strong>Microsoft Authenticator</strong> - Enterprise authentication app</li>
+          <li><strong>Entrust IdentityGuard</strong> - Professional security solution</li>
+        </ul>
+        
+        <div class="divider"></div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">📱 Activation Steps</h3>
+        <ul class="feature-list">
+          <li><strong>Step 1:</strong> Set up your chosen authenticator app</li>
+          <li><strong>Step 2:</strong> Click the activation link below</li>
+          <li><strong>Step 3:</strong> Select your authenticator provider</li>
+          <li><strong>Step 4:</strong> Enter the authentication code</li>
+          <li><strong>Step 5:</strong> Start using your secure subscription!</li>
+        </ul>
+        
+        <p>If you encounter any issues during activation, please contact our support team immediately.</p>
+        
+        <p>Thank you for choosing CRS Platform for your secure communication needs!</p>
+      `;
+
+    const htmlContent = createEmailTemplate(
+      "Subscription Approved - Ready to Activate!",
+      emailContent,
+      activationUrl,
+      "Activate Subscription"
+    );
+
+    const textContent = `
+  Subscription Approved - CRS Platform
+  
+  Hi ${username}!
+  
+  Great news! Your ${plan} subscription request has been reviewed and approved. You can now activate your subscription to start using CRS Platform's secure communication features.
+  
+  Important: You have 7 days to activate your subscription using the link below.
+  
+  Activation Requirements:
+  Before activating, please ensure you have one of these authenticators ready:
+  • Google Authenticator - Download from App Store/Google Play
+  • Microsoft Authenticator - Enterprise authentication app
+  • Entrust IdentityGuard - Professional security solution
+  
+  Activation Steps:
+  1. Set up your chosen authenticator app
+  2. Click the activation link: ${activationUrl}
+  3. Select your authenticator provider
+  4. Enter the authentication code
+  5. Start using your secure subscription!
+  
+  If you encounter any issues during activation, please contact our support team immediately.
+  
+  Thank you for choosing CRS Platform for your secure communication needs!
+  
+  Best regards,
+  The CRS Platform Team
+  
+  ---
+  CRS Platform - Secure Communication Solutions
+      `;
+
+    const mailOptions = {
+      from: {
+        name: "CRS Platform",
+        address: process.env.EMAIL_USER,
+      },
+      to: email,
+      subject: "🎉 Subscription Approved - Ready to Activate!",
+      html: htmlContent,
+      text: textContent,
+      headers: {
+        "X-Priority": "1",
+        "X-MSMail-Priority": "High",
+        Importance: "high",
+      },
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ Subscription approved email sent successfully to ${email}`);
+
+    return {
+      success: true,
+      messageId: info.messageId,
+      email: email,
+    };
+  } catch (error) {
+    console.error("❌ Error sending subscription approved email:", error);
+    throw new Error(
+      `Failed to send subscription approved email: ${error.message}`
+    );
+  }
+};
+
+// Send subscription rejected email
+const sendSubscriptionRejectedEmail = async (
+  email,
+  username,
+  plan,
+  reason,
+  comments
+) => {
+  try {
+    console.log(`📧 Preparing subscription rejected email for ${email}...`);
+
+    const transporter = createTransporter();
+    const supportUrl = `${process.env.FRONTEND_URL}/support`;
+    const resubmitUrl = `${process.env.FRONTEND_URL}/register`;
+
+    const emailContent = `
+        <h2>Hi ${username},</h2>
+        <div class="alert">
+          <p><strong>⚠️ Subscription Request Update</strong></p>
+        </div>
+        <p>We have reviewed your <strong>${plan}</strong> subscription request and unfortunately cannot approve it at this time.</p>
+        
+        <div class="alert">
+          <p><strong>Reason for rejection:</strong> ${reason}</p>
+          ${
+            comments
+              ? `<p><strong>Additional comments:</strong> ${comments}</p>`
+              : ""
+          }
+        </div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">📋 Next Steps</h3>
+        <ul class="feature-list">
+          <li><strong>Review the feedback</strong> - Please review the reason provided above</li>
+          <li><strong>Address the issues</strong> - Make necessary corrections to your documentation</li>
+          <li><strong>Resubmit if appropriate</strong> - You can submit a new application once issues are resolved</li>
+          <li><strong>Contact support</strong> - Reach out if you need clarification on the rejection</li>
+        </ul>
+        
+        <div class="divider"></div>
+        
+        <h3 style="color: #333; margin-bottom: 15px;">🔄 Resubmission Guidelines</h3>
+        <p>If you choose to resubmit your application, please ensure:</p>
+        <ul class="feature-list">
+          <li>All encryption cards are clear and readable</li>
+          <li>Documents meet our security requirements</li>
+          <li>All required information is complete and accurate</li>
+          <li>Any specific issues mentioned above are addressed</li>
+        </ul>
+        
+        <p>We apologize for any inconvenience and appreciate your understanding. Our security standards help ensure the safety and reliability of the CRS Platform for all users.</p>
+        
+        <p>If you have questions about this decision or need assistance with resubmission, please don't hesitate to contact our support team.</p>
+      `;
+
+    const htmlContent = createEmailTemplate(
+      "Subscription Request Update - CRS Platform",
+      emailContent,
+      supportUrl,
+      "Contact Support"
+    );
+
+    const textContent = `
+  Subscription Request Update - CRS Platform
+  
+  Hi ${username},
+  
+  We have reviewed your ${plan} subscription request and unfortunately cannot approve it at this time.
+  
+  Reason for rejection: ${reason}
+  ${comments ? `Additional comments: ${comments}` : ""}
+  
+  Next Steps:
+  • Review the feedback - Please review the reason provided above
+  • Address the issues - Make necessary corrections to your documentation
+  • Resubmit if appropriate - You can submit a new application once issues are resolved
+  • Contact support - Reach out if you need clarification on the rejection
+  
+  Resubmission Guidelines:
+  If you choose to resubmit your application, please ensure:
+  • All encryption cards are clear and readable
+  • Documents meet our security requirements
+  • All required information is complete and accurate
+  • Any specific issues mentioned above are addressed
+  
+  We apologize for any inconvenience and appreciate your understanding. Our security standards help ensure the safety and reliability of the CRS Platform for all users.
+  
+  Support: ${supportUrl}
+  Resubmit: ${resubmitUrl}
+  
+  Best regards,
+  The CRS Platform Team
+  
+  ---
+  CRS Platform - Secure Communication Solutions
+      `;
+
+    const mailOptions = {
+      from: {
+        name: "CRS Platform",
+        address: process.env.EMAIL_USER,
+      },
+      to: email,
+      subject: "Subscription Request Update - CRS Platform",
+      html: htmlContent,
+      text: textContent,
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ Subscription rejected email sent successfully to ${email}`);
+
+    return {
+      success: true,
+      messageId: info.messageId,
+      email: email,
+    };
+  } catch (error) {
+    console.error("❌ Error sending subscription rejected email:", error);
+    throw new Error(
+      `Failed to send subscription rejected email: ${error.message}`
+    );
+  }
+};
+
 module.exports = {
   generateVerificationToken,
   sendVerificationEmail,
@@ -538,4 +896,7 @@ module.exports = {
   sendPasswordResetEmail,
   testEmailConfiguration,
   createTransporter,
+  sendSubscriptionQueuedEmail,
+  sendSubscriptionApprovedEmail,
+  sendSubscriptionRejectedEmail,
 };

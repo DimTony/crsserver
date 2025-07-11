@@ -1,6 +1,7 @@
-// controllers/authController.js - Enhanced with graceful error handling
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 const User = require("../models/user");
 const Device = require("../models/device");
 const Subscription = require("../models/subscription");
@@ -13,12 +14,22 @@ const {
   generateVerificationToken,
   sendVerificationEmail,
   sendWelcomeEmail,
+  sendSubscriptionQueuedEmail,
 } = require("../config/emailService");
 
 // Helper function to generate random string for TOTP secret
 const generateRandomString = (length) => {
-  const crypto = require("crypto");
   return crypto.randomBytes(length).toString("hex");
+};
+
+// Helper function to calculate queue position
+const calculateQueuePosition = async (imei, session) => {
+  const pendingCount = await Subscription.countDocuments({
+    imei,
+    status: "PENDING",
+  }).session(session);
+
+  return (pendingCount + 1).toString();
 };
 
 const register = async (req, res, next) => {
@@ -32,7 +43,11 @@ const register = async (req, res, next) => {
     phoneNumber,
     plan,
     files,
+    submissionNotes,
   } = req.body;
+
+  // Start a database session for transaction
+  const session = await mongoose.startSession();
 
   try {
     // Input validation
@@ -48,9 +63,8 @@ const register = async (req, res, next) => {
       throw new CustomError(400, "Please provide all required fields");
     }
 
-    // Check if files were uploaded (handle upload failures gracefully)
+    // File validation
     if (!files || files.length === 0) {
-      // Check if there were upload errors
       if (req.body.uploadErrors && req.body.uploadErrors.length > 0) {
         return res.status(400).json({
           success: false,
@@ -59,20 +73,13 @@ const register = async (req, res, next) => {
           uploadErrors: req.body.uploadErrors,
         });
       }
-
       throw new CustomError(
         400,
         "Please upload at least one encryption card file"
       );
     }
 
-    // Handle partial upload failures
-    if (req.body.uploadWarnings && req.body.uploadWarnings.length > 0) {
-      console.warn(`⚠️ Some files failed to upload:`, req.body.uploadWarnings);
-      // Continue with registration but log the warnings
-    }
-
-    // Validation regex patterns
+    // Validation checks
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     const phoneNumberRegex = /^\+?[\d\s\-()]{10,}$/;
 
@@ -84,7 +91,6 @@ const register = async (req, res, next) => {
       throw new CustomError(400, "Please provide a valid phone number");
     }
 
-    // Password strength check
     if (password.length < 8) {
       throw new CustomError(400, "Password must be at least 8 characters long");
     }
@@ -103,24 +109,29 @@ const register = async (req, res, next) => {
       throw new CustomError(400, "Invalid encryption plan");
     }
 
-    // Check if user already exists
-    const existingUserByEmail = await User.findOne({ email });
-    const existingUserByUsername = await User.findOne({ username });
+    // Start transaction
+    await session.startTransaction();
+
+    // Check existing users within transaction
+    const existingUserByEmail = await User.findOne({ email }).session(session);
+    const existingUserByUsername = await User.findOne({ username }).session(
+      session
+    );
 
     if (existingUserByEmail) {
-      // If user exists but email not verified, handle re-registration
       if (!existingUserByEmail.isEmailVerified) {
         try {
           const verificationToken =
             existingUserByEmail.generateVerificationToken();
-          await existingUserByEmail.save();
+          await existingUserByEmail.save({ session });
 
-          // Try to send verification email, but don't fail registration if email fails
+          // Commit transaction before sending email
+          await session.commitTransaction();
+
           try {
             await sendVerificationEmail(email, verificationToken, username);
           } catch (emailError) {
             console.error("Failed to send verification email:", emailError);
-            // Continue without failing
           }
 
           return res.status(200).json({
@@ -133,6 +144,7 @@ const register = async (req, res, next) => {
             },
           });
         } catch (dbError) {
+          await session.abortTransaction();
           console.error("Database error during re-registration:", dbError);
           throw new CustomError(
             500,
@@ -140,7 +152,7 @@ const register = async (req, res, next) => {
           );
         }
       }
-
+      await session.abortTransaction();
       throw new CustomError(
         400,
         "User with this email already exists and is verified"
@@ -148,40 +160,26 @@ const register = async (req, res, next) => {
     }
 
     if (existingUserByUsername) {
+      await session.abortTransaction();
       throw new CustomError(400, "Username already taken");
     }
 
-    // Check if device already exists (make this optional to prevent blocking)
-    try {
-      const existingDevice = await Device.findOne({ imei });
-      if (existingDevice) {
-        console.warn(`⚠️ Device with IMEI ${imei} already exists`);
-        // Don't block registration, just log warning
-      }
-    } catch (deviceError) {
-      console.error("Error checking existing device:", deviceError);
-      // Continue with registration
+    // Check for active subscriptions on phone number
+    const hasActiveSubscription = await Subscription.findOne({
+      phone: phoneNumber,
+      status: "ACTIVE",
+    }).session(session);
+
+    if (hasActiveSubscription) {
+      await session.abortTransaction();
+      throw new CustomError(
+        400,
+        "Phone number already has an active subscription"
+      );
     }
 
-    // Check if phone number already has active subscription
-    try {
-      const existingSubscription = await Subscription.findOne({
-        phone: phoneNumber,
-        status: { $in: ["ACTIVE", "PENDING"] },
-      });
-      if (existingSubscription) {
-        throw new CustomError(
-          400,
-          "Phone number already has an active subscription"
-        );
-      }
-    } catch (subscriptionError) {
-      if (subscriptionError instanceof CustomError) {
-        throw subscriptionError;
-      }
-      console.error("Error checking existing subscription:", subscriptionError);
-      // Continue with registration
-    }
+    // Check for existing device
+    const existingDevice = await Device.findOne({ imei }).session(session);
 
     // Hash password
     const salt = await bcrypt.genSalt(12);
@@ -190,89 +188,92 @@ const register = async (req, res, next) => {
     // Generate email verification token
     const verificationToken = generateVerificationToken();
 
-    // Create new user with transaction-like approach
-    let newUser, newDevice, newSubscription;
+    let newUser, device, newSubscription;
 
-    try {
-      // Create new user
-      newUser = new User({
-        username,
-        email,
-        password: hashedPassword,
-        isEmailVerified: false,
-        isActive: false,
-        emailVerificationToken: verificationToken,
-        emailVerificationExpires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+    // Create new user within transaction
+    newUser = new User({
+      username,
+      email,
+      password: hashedPassword,
+      isEmailVerified: false,
+      isActive: false,
+      emailVerificationToken: verificationToken,
+      emailVerificationExpires: Date.now() + 24 * 60 * 60 * 1000,
+      role: "user",
+    });
+
+    await newUser.save({ session });
+    console.log(`✅ User created: ${newUser._id}`);
+
+    // Handle device creation/retrieval within transaction
+    if (existingDevice) {
+      // Check if device is already associated with another user
+      if (
+        existingDevice.user &&
+        existingDevice.user.toString() !== newUser._id.toString()
+      ) {
+        await session.abortTransaction();
+        throw new CustomError(
+          400,
+          "Device is already registered to another user"
+        );
+      }
+
+      // Update existing device with new user if not already set
+      if (!existingDevice.user) {
+        existingDevice.user = newUser._id;
+        existingDevice.deviceName = deviceName; // Update device name if needed
+        await existingDevice.save({ session });
+        device = existingDevice;
+        console.log(`✅ Existing device updated: ${device._id}`);
+      } else {
+        device = existingDevice;
+        console.log(`✅ Using existing device: ${device._id}`);
+      }
+    } else {
+      // Create new device
+      const totpSecret = generateRandomString(32);
+      device = new Device({
+        user: newUser._id,
+        imei,
+        totpSecret,
+        deviceName,
       });
 
-      await newUser.save();
-      console.log(`✅ User created: ${newUser._id}`);
-
-      // Generate TOTP secret and create device
-      try {
-        const totpSecret = generateRandomString(32);
-        newDevice = new Device({
-          user: newUser._id,
-          imei,
-          totpSecret,
-          deviceName,
-        });
-
-        await newDevice.save();
-        console.log(`✅ Device created: ${newDevice._id}`);
-      } catch (deviceError) {
-        console.error("Failed to create device:", deviceError);
-        // Clean up user if device creation fails
-        await User.findByIdAndDelete(newUser._id);
-        throw new CustomError(
-          500,
-          "Failed to register device. Please try again."
-        );
-      }
-
-      // Create subscription
-      try {
-        const subscriptionPrice = getSubscriptionPrice(plan);
-        const startDate = new Date();
-        const subscriptionDuration = getSubscriptionDuration(plan);
-        const endDate = new Date(
-          startDate.getTime() + subscriptionDuration * 24 * 60 * 60 * 1000
-        );
-
-        newSubscription = new Subscription({
-          user: newUser._id,
-          imei,
-          phone: phoneNumber,
-          email,
-          plan,
-          price: subscriptionPrice,
-          cards: files,
-          startDate,
-          endDate,
-          status: "PENDING",
-        });
-
-        await newSubscription.save();
-        console.log(`✅ Subscription created: ${newSubscription._id}`);
-      } catch (subscriptionError) {
-        console.error("Failed to create subscription:", subscriptionError);
-        // Clean up user and device if subscription creation fails
-        await User.findByIdAndDelete(newUser._id);
-        await Device.findByIdAndDelete(newDevice._id);
-        throw new CustomError(
-          500,
-          "Failed to create subscription. Please try again."
-        );
-      }
-    } catch (creationError) {
-      console.error("Error during user creation process:", creationError);
-      if (creationError instanceof CustomError) {
-        throw creationError;
-      }
-      throw new CustomError(500, "Registration failed. Please try again.");
+      await device.save({ session });
+      console.log(`✅ New device created: ${device._id}`);
     }
 
-    // Send verification email (don't fail registration if email fails)
+    // Calculate queue position for this device
+    const queuePosition = await calculateQueuePosition(imei, session);
+
+    // Create subscription with PENDING status within transaction
+    const subscriptionPrice = getSubscriptionPrice(plan);
+
+    newSubscription = new Subscription({
+      user: newUser._id.toString(),
+      imei,
+      deviceName,
+      phone: phoneNumber,
+      email,
+      plan,
+      price: subscriptionPrice,
+      cards: files,
+      queuePosition,
+      status: "PENDING",
+      // startDate and endDate will be set when subscription is activated
+    });
+
+    await newSubscription.save({ session });
+    console.log(
+      `✅ Subscription created with PENDING status: ${newSubscription._id}`
+    );
+
+    // Commit transaction - all operations succeeded
+    await session.commitTransaction();
+    console.log("✅ Transaction committed successfully");
+
+    // Send verification email (outside transaction since it's not critical for data consistency)
     let emailSent = false;
     try {
       await sendVerificationEmail(email, verificationToken, username);
@@ -280,48 +281,67 @@ const register = async (req, res, next) => {
       emailSent = true;
     } catch (emailError) {
       console.error("Failed to send verification email:", emailError);
-      // Don't fail registration, just note that email failed
       emailSent = false;
     }
 
-    // Send success response
+    // Send subscription queued notification email (outside transaction)
+    try {
+      await sendSubscriptionQueuedEmail(email, username, plan, queuePosition);
+    } catch (emailError) {
+      console.error("Failed to send subscription queued email:", emailError);
+    }
+
+    // Prepare response
     const responseData = {
       requiresVerification: true,
       email: newUser.email,
       username: newUser.username,
+      subscription: {
+        id: newSubscription._id,
+        plan: newSubscription.plan,
+        status: newSubscription.status,
+        queuePosition: newSubscription.queuePosition,
+        estimatedReviewTime: "2-3 business days",
+      },
+      device: {
+        id: device._id,
+        imei: device.imei,
+        deviceName: device.deviceName,
+        isExisting: !!existingDevice,
+      },
       message: emailSent
-        ? "A verification email has been sent to your email address. Please click the link in the email to verify your account before logging in."
-        : "Registration successful, but we couldn't send the verification email. Please contact support for manual verification.",
+        ? "Registration successful! Please verify your email and your subscription request has been queued for admin review."
+        : "Registration successful! Please contact support to verify your account. Your subscription request has been queued for admin review.",
     };
 
-    // Include upload warnings if any
     if (req.body.uploadWarnings && req.body.uploadWarnings.length > 0) {
       responseData.uploadWarnings = req.body.uploadWarnings;
     }
 
     res.status(201).json({
       success: true,
-      message: emailSent
-        ? "User registered successfully. Please check your email to verify your account."
-        : "User registered successfully. Please contact support to verify your account.",
+      message:
+        "User registered successfully. Device registered and subscription queued for admin review.",
       data: responseData,
     });
   } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
     console.error("Registration error:", err);
 
-    // Handle different types of errors appropriately
     if (err instanceof CustomError) {
       next(err);
     } else if (err.code === 11000) {
-      // MongoDB duplicate key error
       const field = Object.keys(err.keyPattern)[0];
       next(new CustomError(400, `${field} already exists`));
     } else if (err.name === "ValidationError") {
-      // Mongoose validation error
       const messages = Object.values(err.errors).map((e) => e.message);
       next(new CustomError(400, messages.join(", ")));
     } else if (err.name === "MongoNetworkError") {
-      // Database connection error
       next(
         new CustomError(
           500,
@@ -329,7 +349,6 @@ const register = async (req, res, next) => {
         )
       );
     } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
-      // Network errors
       next(
         new CustomError(
           500,
@@ -337,7 +356,6 @@ const register = async (req, res, next) => {
         )
       );
     } else {
-      // Generic server error
       next(
         new CustomError(
           500,
@@ -345,6 +363,375 @@ const register = async (req, res, next) => {
         )
       );
     }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+};
+
+// Get user's subscription status
+const getSubscriptionStatus = async (req, res, next) => {
+  try {
+    const userId = req.user._id.toString();
+
+    // Get all user's subscriptions
+    const subscriptions = await Subscription.find({ user: userId }).sort({
+      createdAt: -1,
+    });
+
+    // Separate by status
+    const activeSubscriptions = subscriptions.filter(
+      (sub) => sub.status === "ACTIVE"
+    );
+    const pendingSubscriptions = subscriptions.filter(
+      (sub) => sub.status === "PENDING"
+    );
+    const expiredSubscriptions = subscriptions.filter(
+      (sub) => sub.status === "EXPIRED"
+    );
+    const cancelledSubscriptions = subscriptions.filter(
+      (sub) => sub.status === "CANCELLED"
+    );
+
+    res.json({
+      success: true,
+      data: {
+        activeSubscriptions,
+        pendingSubscriptions,
+        expiredSubscriptions,
+        cancelledSubscriptions,
+        totalSubscriptions: subscriptions.length,
+        hasActiveSubscription: activeSubscriptions.length > 0,
+        pendingApproval: pendingSubscriptions.length,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get device queue status (shows all subscriptions for a specific device)
+const getDeviceQueueStatus = async (req, res, next) => {
+  try {
+    const { imei } = req.params;
+
+    // Get all subscriptions for this device, ordered by queue position
+    const deviceSubscriptions = await Subscription.find({ imei })
+      .populate("user", "username email")
+      .sort({ queuePosition: 1, createdAt: 1 });
+
+    const queueStats = {
+      totalInQueue: deviceSubscriptions.filter(
+        (sub) => sub.status === "PENDING"
+      ).length,
+      activeSubscriptions: deviceSubscriptions.filter(
+        (sub) => sub.status === "ACTIVE"
+      ).length,
+      expiredSubscriptions: deviceSubscriptions.filter(
+        (sub) => sub.status === "EXPIRED"
+      ).length,
+      cancelledSubscriptions: deviceSubscriptions.filter(
+        (sub) => sub.status === "CANCELLED"
+      ).length,
+    };
+
+    res.json({
+      success: true,
+      data: {
+        imei,
+        subscriptions: deviceSubscriptions,
+        queueStats,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Admin method to approve/reject subscription requests
+const updateSubscriptionStatus = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const { status, adminNotes } = req.body;
+    const adminId = req.user._id;
+
+    // Validate status
+    const validStatuses = ["PENDING", "ACTIVE", "EXPIRED", "CANCELLED"];
+    if (!validStatuses.includes(status)) {
+      throw new CustomError(400, "Invalid status");
+    }
+
+    const subscription = await Subscription.findById(subscriptionId).populate(
+      "user",
+      "email username"
+    );
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    const session = await mongoose.startSession();
+    await session.startTransaction();
+
+    try {
+      // Update subscription status
+      subscription.status = status;
+
+      if (status === "ACTIVE") {
+        // Set start and end dates when activating
+        const subscriptionDuration = getSubscriptionDuration(subscription.plan);
+        subscription.startDate = new Date();
+        subscription.endDate = new Date(
+          Date.now() + subscriptionDuration * 24 * 60 * 60 * 1000
+        );
+
+        // Check if there's already an active subscription for this device
+        const existingActive = await Subscription.findOne({
+          imei: subscription.imei,
+          status: "ACTIVE",
+          _id: { $ne: subscriptionId },
+        }).session(session);
+
+        if (existingActive) {
+          await session.abortTransaction();
+          throw new CustomError(
+            400,
+            "Device already has an active subscription"
+          );
+        }
+      } else if (status === "CANCELLED" || status === "EXPIRED") {
+        // Clear dates when cancelling or expiring
+        if (status === "EXPIRED" && !subscription.endDate) {
+          subscription.endDate = new Date();
+        }
+      }
+
+      // Add admin notes and tracking
+      if (adminNotes) {
+        subscription.adminNotes = adminNotes;
+      }
+      subscription.reviewedBy = adminId;
+      subscription.reviewedAt = new Date();
+
+      await subscription.save({ session });
+
+      // If activating, recalculate queue positions for remaining pending subscriptions
+      if (status === "ACTIVE") {
+        const pendingSubscriptions = await Subscription.find({
+          imei: subscription.imei,
+          status: "PENDING",
+          _id: { $ne: subscriptionId },
+        })
+          .sort({ queuePosition: 1, createdAt: 1 })
+          .session(session);
+
+        // Update queue positions
+        for (let i = 0; i < pendingSubscriptions.length; i++) {
+          pendingSubscriptions[i].queuePosition = (i + 1).toString();
+          await pendingSubscriptions[i].save({ session });
+        }
+      }
+
+      await session.commitTransaction();
+
+      // Send notification email to user based on status
+      // ... implement email notification logic
+
+      res.json({
+        success: true,
+        message: `Subscription ${status.toLowerCase()} successfully`,
+        data: {
+          subscriptionId: subscription._id,
+          status: subscription.status,
+          user: subscription.user,
+          imei: subscription.imei,
+          plan: subscription.plan,
+          startDate: subscription.startDate,
+          endDate: subscription.endDate,
+        },
+      });
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Cancel user's own subscription
+const cancelSubscription = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const userId = req.user._id.toString();
+
+    const subscription = await Subscription.findOne({
+      _id: subscriptionId,
+      user: userId,
+      status: { $in: ["PENDING", "ACTIVE"] },
+    });
+
+    if (!subscription) {
+      throw new CustomError(
+        404,
+        "Subscription not found or cannot be cancelled"
+      );
+    }
+
+    subscription.status = "CANCELLED";
+    subscription.cancelledAt = new Date();
+    subscription.cancelledBy = userId;
+
+    await subscription.save();
+
+    res.json({
+      success: true,
+      message: "Subscription cancelled successfully",
+      data: {
+        subscriptionId: subscription._id,
+        status: subscription.status,
+        cancelledAt: subscription.cancelledAt,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Helper method to check for active subscriptions
+const hasActiveSubscription = async (phoneNumber, options = {}) => {
+  return await Subscription.findOne(
+    {
+      phone: phoneNumber,
+      status: "ACTIVE",
+    },
+    null,
+    options
+  );
+};
+
+
+// Activate approved subscription with authenticator
+const activateSubscription = async (req, res, next) => {
+  try {
+    const {
+      queueId,
+      activationToken,
+      authenticatorProvider,
+      authenticatorCode,
+    } = req.body;
+    const userId = req.user._id;
+
+    if (
+      !queueId ||
+      !activationToken ||
+      !authenticatorProvider ||
+      !authenticatorCode
+    ) {
+      throw new CustomError(400, "Missing required activation parameters");
+    }
+
+    // Find the queued subscription
+    const queuedSub = await SubscriptionQueue.findOne({
+      _id: queueId,
+      user: userId,
+      activationToken,
+      status: "APPROVED",
+      activationExpires: { $gt: new Date() },
+    }).populate("device");
+
+    if (!queuedSub) {
+      throw new CustomError(
+        400,
+        "Invalid activation token or subscription not found"
+      );
+    }
+
+    // Check if user already has an active subscription
+    const existingActive = await Subscription.hasActiveSubscription(userId);
+    if (existingActive) {
+      throw new CustomError(
+        400,
+        "You already have an active subscription. Please cancel it first."
+      );
+    }
+
+    // Verify authenticator (implement based on your authenticator integration)
+    const isAuthenticatorValid = await verifyAuthenticator(
+      authenticatorProvider,
+      authenticatorCode,
+      req.user.email
+    );
+
+    if (!isAuthenticatorValid) {
+      throw new CustomError(400, "Invalid authenticator code");
+    }
+
+    // Create active subscription
+    const endDate = new Date(
+      Date.now() + queuedSub.duration * 24 * 60 * 60 * 1000
+    );
+
+    const activeSubscription = new Subscription({
+      user: userId,
+      device: queuedSub.device._id,
+      queuedSubscription: queuedSub._id,
+      plan: queuedSub.plan,
+      price: queuedSub.price,
+      encryptionCards: queuedSub.encryptionCards,
+      phoneNumber: queuedSub.phoneNumber,
+      startDate: new Date(),
+      endDate,
+      status: "ACTIVE",
+      authenticator: {
+        provider: authenticatorProvider,
+        providerId: authenticatorCode, // Store the authenticator ID
+        lastVerified: new Date(),
+      },
+      activatedBy: userId,
+    });
+
+    await activeSubscription.save();
+
+    // Update queued subscription status
+    queuedSub.status = "ACTIVATED";
+    queuedSub.authenticatorSetup.setupCompleted = true;
+    queuedSub.authenticatorSetup.provider = authenticatorProvider;
+    await queuedSub.save();
+
+    res.json({
+      success: true,
+      message: "Subscription activated successfully!",
+      data: {
+        subscription: activeSubscription,
+        activatedAt: activeSubscription.activatedAt,
+        expiresAt: activeSubscription.endDate,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Placeholder for authenticator verification - implement based on your chosen providers
+const verifyAuthenticator = async (provider, code, userEmail) => {
+  // Implement verification logic for Google, Microsoft, or Entrust
+  // This would involve API calls to the respective authenticator services
+
+  switch (provider) {
+    case "google":
+      // Implement Google Authenticator verification
+      return true; // Placeholder
+    case "microsoft":
+      // Implement Microsoft Authenticator verification
+      return true; // Placeholder
+    case "entrust":
+      // Implement Entrust verification
+      return true; // Placeholder
+    default:
+      return false;
   }
 };
 
@@ -555,7 +942,7 @@ const resendVerificationEmail = async (req, res, next) => {
 const getUser = async (req, res, next) => {
   try {
     let user = await User.findById(req.user._id).select(
-      "-password -emailVerificationToken"
+      "-password -emailVerificationToken -encryptionCards"
     );
 
     if (!user) {
@@ -566,7 +953,9 @@ const getUser = async (req, res, next) => {
     }
 
     const devices = await Device.find({ user: req.user._id });
-    const subscriptions = await Subscription.find({ user: req.user._id });
+    const subscriptions = await Subscription.find({
+      user: req.user._id,
+    }).select("-cards");
 
     // Convert Mongoose document to plain object
     user = user.toObject();
@@ -643,9 +1032,15 @@ const logout = async (req, res, next) => {
 module.exports = {
   login,
   register,
+  getSubscriptionStatus,
+  activateSubscription,
   verifyEmail,
   resendVerificationEmail,
   getUser,
   passUser,
   logout,
+  getDeviceQueueStatus,
+  updateSubscriptionStatus,
+  cancelSubscription,
+  hasActiveSubscription,
 };

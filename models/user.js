@@ -55,6 +55,11 @@ const UserSchema = new mongoose.Schema(
         default: "PENDING",
       },
     },
+    role: {
+      type: String,
+      enum: ["user", "admin", "super_admin", "guest"],
+      default: "guest",
+    },
     encryptionCards: [
       {
         originalName: String,
@@ -84,6 +89,35 @@ const UserSchema = new mongoose.Schema(
         default: 0,
       },
       activeDevices: {
+        type: Number,
+        default: 1,
+      },
+    },
+    adminInfo: {
+      employeeId: {
+        type: String,
+        default: 1,
+      },
+      department: {
+        type: String,
+      },
+      accessLevel: {
+        type: Number,
+        default: 1,
+      },
+      canApproveSubscriptions: {
+        type: Boolean,
+        default: false,
+      },
+      canViewAnalytics: {
+        type: Boolean,
+        default: false,
+      },
+      canManageUsers: {
+        type: Boolean,
+        default: false,
+      },
+      maxApprovalAmount: {
         type: Number,
         default: 1,
       },
