@@ -1078,7 +1078,7 @@ const resendVerificationEmail = async (req, res, next) => {
   }
 };
 
-// Keep other methods the same...
+// Updated getUser function
 const getUser = async (req, res, next) => {
   try {
     let user = await User.findById(req.user._id).select(
@@ -1092,10 +1092,53 @@ const getUser = async (req, res, next) => {
       });
     }
 
+    // Get user's devices
     const devices = await Device.find({ user: req.user._id });
+    
+    // Get user's subscriptions
     const subscriptions = await Subscription.find({
       user: req.user._id,
     }).select("-cards");
+
+    // Get user's transaction history with pagination (latest first)
+    const transactionHistory = await Transaction.find({
+      user: req.user._id
+    })
+    .populate("subscription", "plan status imei deviceName")
+    .populate("device", "deviceName imei")
+    .populate("processedBy", "username email")
+    .sort({ createdAt: -1 }) // Latest transactions first
+    .limit(50) // Limit to last 50 transactions to avoid large responses
+    .select("-metadata.userAgent -metadata.ipAddress"); // Exclude sensitive metadata
+
+    // Get transaction summary statistics
+    const transactionStats = await Transaction.aggregate([
+      { $match: { user: req.user._id } },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$amount" }
+        }
+      }
+    ]);
+
+    // Calculate total spent and transaction counts
+    const totalSpent = await Transaction.aggregate([
+      { 
+        $match: { 
+          user: req.user._id, 
+          status: "COMPLETED" 
+        } 
+      },
+      {
+        $group: {
+          _id: null,
+          totalAmount: { $sum: "$amount" },
+          completedTransactions: { $sum: 1 }
+        }
+      }
+    ]);
 
     // Convert Mongoose document to plain object
     user = user.toObject();
@@ -1103,6 +1146,10 @@ const getUser = async (req, res, next) => {
     // Attach related data
     user.devices = devices;
     user.subscriptions = subscriptions;
+    user.transactionHistory = transactionHistory;
+    user.transactionStats = transactionStats;
+    user.totalSpent = totalSpent[0]?.totalAmount || 0;
+    user.completedTransactions = totalSpent[0]?.completedTransactions || 0;
 
     res.json({
       success: true,
