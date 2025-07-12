@@ -280,29 +280,32 @@ const register = async (req, res, next) => {
       `✅ Subscription created with PENDING status: ${newSubscription._id}`
     );
 
-    // **NEW: Create transaction record**
     try {
-      transaction = await Transaction.createSubscriptionTransaction({
+      transaction = new Transaction({
         user: newUser._id.toString(),
-        _id: newSubscription._id,
+        subscription: newSubscription._id,
         device: device._id,
-        price: subscriptionPrice,
+        transactionId: Transaction.generateTransactionId(),
+        type: "SUBSCRIPTION_CREATED",
+        amount: subscriptionPrice,
         plan,
-        imei,
-        deviceName,
-        phone: phoneNumber,
-        email,
-        cards: files,
+        status: "PENDING",
         queuePosition,
-        submissionNotes,
-        createdAt: new Date(),
+        queuedAt: new Date(),
+        metadata: {
+          userAgent: requestMetadata.userAgent || "Unknown",
+          ipAddress: requestMetadata.ipAddress || "Unknown",
+          deviceInfo: {
+            // ✅ Always provide as proper object
+            imei: imei || "",
+            deviceName: deviceName || "",
+          },
+          submissionNotes: submissionNotes || "",
+          encryptionCards: files || [],
+          phoneNumber: phoneNumber || "",
+          email: email || "",
+        },
       });
-
-      // Add request metadata to transaction
-      transaction.metadata = {
-        ...transaction.metadata,
-        ...requestMetadata,
-      };
 
       await transaction.save({ session });
       console.log(
@@ -311,7 +314,6 @@ const register = async (req, res, next) => {
     } catch (transactionError) {
       console.error("Failed to create transaction record:", transactionError);
       // Don't fail the registration for transaction logging errors
-      // but log the error for investigation
     }
 
     // Commit transaction - all operations succeeded

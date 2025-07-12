@@ -2,6 +2,218 @@
 const Transaction = require("../models/transaction");
 const Subscription = require("../models/subscription");
 const User = require("../models/user");
+const { getSubscriptionDuration } = require("./helpers");
+
+// Process expired subscriptions
+const processExpiredSubscriptions = async () => {
+  try {
+    console.log("🔄 Processing expired subscriptions...");
+
+    const expiredSubscriptions = await Subscription.find({
+      status: "ACTIVE",
+      endDate: { $lt: new Date() }
+    });
+
+    console.log(`📊 Found ${expiredSubscriptions.length} expired subscriptions`);
+
+    for (const subscription of expiredSubscriptions) {
+      // Create expiration transaction
+      const transaction = new Transaction({
+        user: subscription.user,
+        subscription: subscription._id,
+        transactionId: Transaction.generateTransactionId(),
+        type: "SUBSCRIPTION_EXPIRED",
+        amount: 0,
+        plan: subscription.plan,
+        status: "COMPLETED",
+        completedAt: new Date(),
+        metadata: {
+          expiredAt: new Date(),
+          originalEndDate: subscription.endDate
+        }
+      });
+
+      await transaction.save();
+
+      // Update subscription status
+      subscription.status = "EXPIRED";
+      await subscription.save();
+
+      console.log(`✅ Expired subscription ${subscription._id}`);
+    }
+
+    return { processed: expiredSubscriptions.length };
+  } catch (error) {
+    console.error("❌ Error processing expired subscriptions:", error);
+    throw error;
+  }
+};
+
+// Process pending plan changes
+const processPendingPlanChanges = async () => {
+  try {
+    console.log("🔄 Processing pending plan changes...");
+
+    const subscriptionsWithPendingChanges = await Subscription.find({
+      "pendingPlanChange.effectiveDate": { $lte: new Date() },
+      status: "ACTIVE"
+    });
+
+    console.log(`📊 Found ${subscriptionsWithPendingChanges.length} pending plan changes`);
+
+    for (const subscription of subscriptionsWithPendingChanges) {
+      const { newPlan, newPrice } = subscription.pendingPlanChange;
+
+      // Create plan change transaction
+      const transaction = new Transaction({
+        user: subscription.user,
+        subscription: subscription._id,
+        transactionId: Transaction.generateTransactionId(),
+        type: "SUBSCRIPTION_DOWNGRADED",
+        amount: newPrice,
+        plan: newPlan,
+        status: "COMPLETED",
+        completedAt: new Date(),
+        metadata: {
+          oldPlan: subscription.plan,
+          newPlan,
+          planChangeEffective: new Date()
+        }
+      });
+
+      await transaction.save();
+
+      // Apply plan change
+      subscription.plan = newPlan;
+      subscription.price = newPrice;
+      subscription.pendingPlanChange = undefined;
+
+      // Extend subscription based on new plan
+      const newDuration = getSubscriptionDuration(newPlan);
+      subscription.endDate = new Date(Date.now() + newDuration * 24 * 60 * 60 * 1000);
+
+      await subscription.save();
+
+      console.log(`✅ Applied plan change for subscription ${subscription._id}`);
+    }
+
+    return { processed: subscriptionsWithPendingChanges.length };
+  } catch (error) {
+    console.error("❌ Error processing pending plan changes:", error);
+    throw error;
+  }
+};
+
+// Retry failed transactions
+const retryFailedTransactions = async () => {
+  try {
+    console.log("🔄 Retrying failed transactions...");
+
+    // Find failed payment transactions from last 7 days
+    const failedTransactions = await Transaction.find({
+      status: "FAILED",
+      type: { $in: ["PAYMENT_PENDING", "PAYMENT_FAILED"] },
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+      retryCount: { $lt: 3 } // Max 3 retry attempts
+    });
+
+    console.log(`📊 Found ${failedTransactions.length} failed transactions to retry`);
+
+    for (const transaction of failedTransactions) {
+      try {
+        // This would integrate with your payment processor
+        const retryResult = await retryPaymentProcessing(transaction);
+
+        if (retryResult.success) {
+          await transaction.updateStatus("COMPLETED", {
+            type: "PAYMENT_COMPLETED",
+            completedAt: new Date(),
+            retryCount: (transaction.retryCount || 0) + 1
+          });
+
+          // Activate associated subscription if needed
+          const subscription = await Subscription.findById(transaction.subscription);
+          if (subscription && subscription.status === "PENDING") {
+            subscription.status = "ACTIVE";
+            subscription.startDate = new Date();
+            subscription.endDate = new Date(
+              Date.now() + getSubscriptionDuration(subscription.plan) * 24 * 60 * 60 * 1000
+            );
+            await subscription.save();
+          }
+
+          console.log(`✅ Retry successful for transaction ${transaction.transactionId}`);
+        } else {
+          // Update retry count
+          transaction.retryCount = (transaction.retryCount || 0) + 1;
+          transaction.metadata = {
+            ...transaction.metadata,
+            lastRetryAt: new Date(),
+            lastRetryError: retryResult.error
+          };
+          await transaction.save();
+
+          console.log(`❌ Retry failed for transaction ${transaction.transactionId}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error retrying transaction ${transaction.transactionId}:`, error);
+      }
+    }
+
+    return { processed: failedTransactions.length };
+  } catch (error) {
+    console.error("❌ Error retrying failed transactions:", error);
+    throw error;
+  }
+};
+
+// Mock payment retry function - replace with actual payment processor
+const retryPaymentProcessing = async (transaction) => {
+  // This would integrate with Stripe, PayPal, etc.
+  return {
+    success: Math.random() > 0.5, // 50% success rate for demo
+    error: "Payment method declined"
+  };
+};
+
+// Generate transaction reports
+const generateDailyTransactionReport = async () => {
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    
+    const endOfDay = new Date();
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const report = await Transaction.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: startOfDay, $lte: endOfDay }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            status: "$status",
+            type: "$type"
+          },
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$amount" }
+        }
+      }
+    ]);
+
+    console.log("📊 Daily Transaction Report:");
+    console.table(report);
+
+    return report;
+  } catch (error) {
+    console.error("❌ Error generating daily report:", error);
+    throw error;
+  }
+};
+
+
 
 // Utility to reconcile transactions with subscriptions
 const reconcileTransactions = async () => {
@@ -348,4 +560,10 @@ module.exports = {
   auditTransactionIntegrity,
   calculateUserLTV,
   exportTransactionData,
+  
+    processExpiredSubscriptions,
+    processPendingPlanChanges,
+    retryFailedTransactions,
+    generateDailyTransactionReport
+  
 };
