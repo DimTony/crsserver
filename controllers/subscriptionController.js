@@ -1,10 +1,414 @@
-// controllers/subscriptionController.js - MISSING
+const mongoose = require("mongoose");
+const speakeasy = require("speakeasy");
+const QRCode = require("qrcode");
+const jwt = require("jsonwebtoken");
 const Transaction = require("../models/transaction");
+const Device = require("../models/device");
 const Subscription = require("../models/subscription");
 const {
   getSubscriptionPrice,
   getSubscriptionDuration,
 } = require("../utils/helpers");
+const CustomError = require("../utils/customError");
+
+
+const SUBSCRIPTION_TYPES = {
+  "mobile-v4-basic": 30,
+  "mobile-v4-premium": 60,
+  "mobile-v4-enterprise": 90,
+  "mobile-v5-basic": 30,
+  "mobile-v5-premium": 60,
+  "full-suite-basic": 60,
+  "full-suite-premium": 90,
+};
+
+const checkDeviceIsOnboarded = async (req, res, next) => {
+  console.log("[checkDeviceIsOnboarded SERVER]:", req.body);
+  const { imei } = req.body;
+  const userId = req.user._id;
+
+  const session = await mongoose.startSession();
+
+  try {
+    if (!imei) {
+      throw new CustomError(400, "Please provide all valid IMEI");
+    }
+
+    await session.startTransaction();
+
+    const existingDeviceByImei = await Device.findOne({
+      user: userId,
+      imei,
+    }).session(session);
+
+    return res.status(200).json({
+      success: true,
+      message: "Onboarding status fetched successfully",
+      data: {
+        isOnboarded: existingDeviceByImei?.isOnboarded || false,
+        deviceExists: !!existingDeviceByImei,
+      },
+    });
+  } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Device check error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
+      next(
+        new CustomError(
+          500,
+          "Network error. Please check your connection and try again."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Device check failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+};
+
+const setupDeviceOtp = async (req, res, next) => {
+  console.log("[setupDeviceOtp SERVER]:", req.body);
+  const { imei, deviceName } = req.body;
+  const userId = req.user._id;
+
+  const session = await mongoose.startSession();
+
+  try {
+    if (!imei || !deviceName) {
+      throw new CustomError(400, "Please provide all required fields");
+    }
+
+    await session.startTransaction();
+
+    const secret = speakeasy.generateSecret({
+      name: `${req.user.email} (${imei.slice(-4)})`,
+      issuer: "CRS",
+      length: 20,
+    });
+
+    await Device.findOneAndUpdate(
+      { user: req.user._id, imei },
+      {
+        user: req.user._id,
+        imei,
+        totpSecret: secret.base32,
+        deviceName: deviceName || "Mobile Device",
+        isOnboarded: false,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+    return res.status(200).json({
+      success: true,
+      message: "Device Setup Initiated successfully",
+      data: {
+        qrCode: qrCodeUrl,
+        secret: secret.base32,
+      },
+    });
+  } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Device setup error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
+      next(
+        new CustomError(
+          500,
+          "Network error. Please check your connection and try again."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Device set up failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+};
+
+const queueSubscription = async (req, res, next) => {
+  console.log("[queueSubscription SERVER]:", req.body);
+  const { subscriptionId } = req.body;
+
+  const session = await mongoose.startSession();
+
+  try {
+    if (!subscriptionId) {
+      throw new CustomError(400, "Please provide all required fields");
+    }
+
+    await session.startTransaction();
+
+    
+
+    const updatedSubscription = await Subscription.findByIdAndUpdate(
+      subscriptionId,
+      {
+        status: 'QUEUED',
+        updatedAt: now,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (!updatedDevice) {
+      throw new CustomError(400, "Device not updated");
+    }
+
+    res.json({
+      success: true,
+      message: "Subscription activated successfully",
+      data: {
+        subscription: updatedSubscription,
+        duration: `${duration} days`,
+        subscriptionType: subscriptionType,
+      },
+    });
+  } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Device setup error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
+      next(
+        new CustomError(
+          500,
+          "Network error. Please check your connection and try again."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Device set up failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+}
+
+const activateSubscription = async (req, res, next) => {
+  console.log("[activateSubscription SERVER]:", req.body);
+  const { subscriptionId, imei, totpCode } = req.body;
+  const userId = req.user._id;
+
+  const session = await mongoose.startSession();
+
+  try {
+    if (!imei || !subscriptionId || !totpCode) {
+      throw new CustomError(400, "Please provide all required fields");
+    }
+
+    await session.startTransaction();
+
+    const subscription = await Subscription.findById(subscriptionId).session(session);
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    console.log("AAA", req.user);
+    console.log("GGG", subscription);
+
+    if (subscription.user.toString() !== req.user._id.toString()) {
+      throw new CustomError(403, "Unauthorized access to subscription");
+    }
+
+    if (subscription.status !== "QUEUED") {
+      throw new CustomError(400, "Subscription not queued");
+    }
+
+    if (subscription.imei !== imei) {
+      throw new CustomError(400, "Invalid IMEI");
+    }
+
+    const device = await Device.findOne({
+      user: userId,
+      imei,
+    }).session(session);
+
+    if (!device) {
+      throw new CustomError(404, "Device not found");
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: device.totpSecret,
+      encoding: "base32",
+      token: totpCode,
+      window: 2, // Allow 2 time steps before/after current time
+    });
+
+    if (!verified) {
+      throw new CustomError(400, "Invalid OTP");
+    }
+
+    const subscriptionType = subscription.subscriptionType;
+    const durationInDays = SUBSCRIPTION_TYPES[subscriptionType];
+
+    if (!durationInDays) {
+      console.warn(
+        `Unknown subscription type: ${subscriptionType}, defaulting to 30 days`
+      );
+    }
+
+    const duration = durationInDays || 30;
+
+    const now = new Date();
+    const endDate = new Date(now);
+    endDate.setDate(endDate.getDate() + duration);
+
+    const updatedSubscription = await Subscription.findByIdAndUpdate(
+      subscriptionId,
+      {
+        status: "ACTIVE",
+        startDate: now,
+        endDate: endDate,
+        updatedAt: now,
+      }
+    );
+
+    const updatedDevice = await Device.findByIdAndUpdate(
+      device._id,
+      {
+        isOnboarded: true,
+        updatedAt: now,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (!updatedDevice) {
+      throw new CustomError(400, "Device not updated");
+    }
+
+    res.json({
+      success: true,
+      message: "Subscription activated successfully",
+      data: {
+        subscription: updatedSubscription,
+        duration: `${duration} days`,
+        subscriptionType: subscriptionType,
+      },
+    });
+  } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Device setup error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
+      next(
+        new CustomError(
+          500,
+          "Network error. Please check your connection and try again."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Device set up failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+};
 
 // Upgrade subscription
 const upgradeSubscription = async (req, res, next) => {
@@ -269,4 +673,7 @@ module.exports = {
   downgradeSubscription,
   cancelSubscription,
   renewSubscription,
+  checkDeviceIsOnboarded,
+  setupDeviceOtp,
+  activateSubscription,
 };

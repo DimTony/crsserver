@@ -10,67 +10,6 @@ const {
   sendSubscriptionRejectedEmail,
 } = require("../config/emailService");
 
-// Helper function to log transaction updates
-const logTransactionUpdate = async (
-  subscriptionId,
-  type,
-  status,
-  adminId,
-  additionalData = {}
-) => {
-  try {
-    // Find existing transaction for this subscription
-    const existingTransaction = await Transaction.findOne({
-      subscription: subscriptionId,
-    }).sort({ createdAt: -1 });
-
-    if (existingTransaction) {
-      // Create a new transaction record for the status change
-      const newTransaction = new Transaction({
-        user: existingTransaction.user,
-        subscription: subscriptionId,
-        device: existingTransaction.device,
-        transactionId: Transaction.generateTransactionId(),
-        type: type,
-        amount: existingTransaction.amount,
-        plan: existingTransaction.plan,
-        status: status,
-        paymentMethod: existingTransaction.paymentMethod,
-        processedBy: adminId,
-        processedAt: new Date(),
-        previousTransaction: existingTransaction._id,
-        metadata: {
-          ...existingTransaction.metadata,
-          ...additionalData.metadata,
-        },
-        adminNotes: additionalData.adminNotes || "",
-        subscriptionPeriod:
-          additionalData.subscriptionPeriod ||
-          existingTransaction.subscriptionPeriod,
-      });
-
-      await newTransaction.save();
-
-      // Update related transactions
-      existingTransaction.relatedTransactions.push(newTransaction._id);
-      await existingTransaction.save();
-
-      console.log(
-        `✅ Transaction logged: ${newTransaction.transactionId} for ${type}`
-      );
-      return newTransaction;
-    } else {
-      console.warn(
-        `⚠️ No existing transaction found for subscription: ${subscriptionId}`
-      );
-      return null;
-    }
-  } catch (error) {
-    console.error("Failed to log transaction update:", error);
-    return null;
-  }
-};
-
 // Get all pending subscriptions for admin review
 const getPendingSubscriptions = async (req, res, next) => {
   try {
@@ -513,92 +452,6 @@ const activateSubscription = async (req, res, next) => {
   }
 };
 
-// Update queue position
-const updateQueuePosition = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { newPosition } = req.body;
-    const adminId = req.user._id;
-
-    if (!newPosition || newPosition < 1) {
-      throw new CustomError(400, "Valid queue position is required");
-    }
-
-    const subscription = await Subscription.findById(id);
-
-    if (!subscription) {
-      throw new CustomError(404, "Subscription not found");
-    }
-
-    if (subscription.status !== "PENDING") {
-      throw new CustomError(
-        400,
-        "Can only update queue position for pending subscriptions"
-      );
-    }
-
-    const oldPosition = subscription.queuePosition;
-
-    // Update queue positions for affected subscriptions
-    if (newPosition !== oldPosition) {
-      if (newPosition < oldPosition) {
-        // Moving up - increment positions of subscriptions between new and old position
-        await Subscription.updateMany(
-          {
-            queuePosition: { $gte: newPosition, $lt: oldPosition },
-            status: "PENDING",
-            _id: { $ne: id },
-          },
-          { $inc: { queuePosition: 1 } }
-        );
-      } else {
-        // Moving down - decrement positions of subscriptions between old and new position
-        await Subscription.updateMany(
-          {
-            queuePosition: { $gt: oldPosition, $lte: newPosition },
-            status: "PENDING",
-            _id: { $ne: id },
-          },
-          { $inc: { queuePosition: -1 } }
-        );
-      }
-
-      subscription.queuePosition = newPosition;
-      await subscription.save();
-
-      // Log transaction
-      await logTransactionUpdate(
-        id,
-        "QUEUE_POSITION_UPDATED",
-        "PENDING",
-        adminId,
-        {
-          adminNotes: `Queue position changed from ${oldPosition} to ${newPosition}`,
-          metadata: {
-            queuePositionChange: {
-              from: oldPosition,
-              to: newPosition,
-              updatedAt: new Date(),
-            },
-          },
-        }
-      );
-    }
-
-    res.json({
-      success: true,
-      message: "Queue position updated successfully",
-      data: {
-        subscription,
-        oldPosition,
-        newPosition,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
 // Bulk operations for admin efficiency
 const bulkUpdateSubscriptions = async (req, res, next) => {
   try {
@@ -876,7 +729,668 @@ const getAdminDashboard = async (req, res, next) => {
   }
 };
 
+const logTransactionUpdate = async (
+  subscriptionId,
+  type,
+  status,
+  adminId,
+  additionalData = {}
+) => {
+  try {
+    const existingTransaction = await Transaction.findOne({
+      subscription: subscriptionId,
+    }).sort({ createdAt: -1 });
 
+    if (existingTransaction) {
+      const newTransaction = new Transaction({
+        user: existingTransaction.user,
+        subscription: subscriptionId,
+        device: existingTransaction.device,
+        transactionId: Transaction.generateTransactionId(),
+        type: type,
+        amount: existingTransaction.amount,
+        plan: existingTransaction.plan,
+        status: status,
+        paymentMethod: existingTransaction.paymentMethod,
+        processedBy: adminId,
+        processedAt: new Date(),
+        previousTransaction: existingTransaction._id,
+        metadata: {
+          ...existingTransaction.metadata,
+          ...additionalData.metadata,
+        },
+        adminNotes: additionalData.adminNotes || "",
+        subscriptionPeriod:
+          additionalData.subscriptionPeriod ||
+          existingTransaction.subscriptionPeriod,
+      });
+
+      await newTransaction.save();
+      existingTransaction.relatedTransactions.push(newTransaction._id);
+      await existingTransaction.save();
+
+      console.log(
+        `✅ Transaction logged: ${newTransaction.transactionId} for ${type}`
+      );
+      return newTransaction;
+    }
+    return null;
+  } catch (error) {
+    console.error("Failed to log transaction update:", error);
+    return null;
+  }
+};
+
+// Queue a subscription for a user (create new or move existing)
+const queueSubscriptionForUser = async (req, res, next) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const {
+      userId,
+      imei,
+      deviceName,
+      phoneNumber,
+      plan,
+      priority = 0,
+      adminNotes = "",
+      cards = [], // Optional: admin can upload cards or use existing
+    } = req.body;
+
+    const adminId = req.user._id;
+
+    // Validation
+    if (!userId || !imei || !plan) {
+      throw new CustomError(400, "Missing required fields: userId, imei, plan");
+    }
+
+    await session.startTransaction();
+
+    // Verify user exists
+    const user = await User.findById(userId).session(session);
+    if (!user) {
+      throw new CustomError(404, "User not found");
+    }
+
+    // Check if device exists, create if needed
+    let device = await Device.findOne({ imei }).session(session);
+    if (!device) {
+      const crypto = require("crypto");
+      const totpSecret = crypto.randomBytes(32).toString("hex");
+
+      device = new Device({
+        user: userId,
+        imei,
+        totpSecret,
+        deviceName: deviceName || "Device",
+      });
+      await device.save({ session });
+      console.log(`✅ Created new device: ${device._id}`);
+    }
+
+    // Check if user already has a queued/pending subscription for this device
+    const existingQueued = await Subscription.findOne({
+      user: userId,
+      imei,
+      status: { $in: ["QUEUED", "PENDING"] },
+    }).session(session);
+
+    if (existingQueued) {
+      throw new CustomError(
+        400,
+        "User already has a queued subscription for this device"
+      );
+    }
+
+    // Calculate subscription price
+    const subscriptionPrice = getSubscriptionPrice(plan);
+
+    // Get next queue position
+    const queuePosition = await Subscription.getNextQueuePosition(imei);
+
+    // Create new subscription
+    const newSubscription = new Subscription({
+      user: userId,
+      imei,
+      deviceName: deviceName || device.deviceName,
+      phone: phoneNumber || user.phoneNumber,
+      email: user.email,
+      plan,
+      price: subscriptionPrice,
+      cards: cards.length > 0 ? cards : [], // Use provided cards or empty array
+      queuePosition,
+      status: "QUEUED",
+      queuedBy: adminId,
+      queuedAt: new Date(),
+      adminNotes,
+      priority,
+    });
+
+    await newSubscription.save({ session });
+    console.log(`✅ Subscription queued: ${newSubscription._id}`);
+
+    // Create transaction record
+    const transaction = new Transaction({
+      user: userId,
+      subscription: newSubscription._id,
+      device: device._id,
+      transactionId: Transaction.generateTransactionId(),
+      type: "SUBSCRIPTION_QUEUED",
+      amount: subscriptionPrice,
+      plan,
+      status: "PENDING",
+      queuePosition,
+      queuedAt: new Date(),
+      processedBy: adminId,
+      processedAt: new Date(),
+      adminNotes: `Admin queued subscription: ${adminNotes}`,
+      metadata: {
+        userAgent: req.get("User-Agent") || "Admin Interface",
+        ipAddress: req.ip || "Unknown",
+        deviceInfo: {
+          imei: imei,
+          deviceName: deviceName || device.deviceName,
+        },
+        adminAction: true,
+        queuedByAdmin: adminId,
+        priority: priority,
+      },
+    });
+
+    await transaction.save({ session });
+    console.log(`✅ Transaction created: ${transaction.transactionId}`);
+
+    // Reorder queue to ensure proper positioning based on priority
+    await Subscription.reorderDeviceQueue(imei);
+
+    await session.commitTransaction();
+
+    // Send notification email (outside transaction)
+    try {
+      await sendSubscriptionQueuedEmail(
+        user.email,
+        user.username,
+        plan,
+        queuePosition
+      );
+    } catch (emailError) {
+      console.error("Failed to send queue notification email:", emailError);
+    }
+
+    // Populate response data
+    await newSubscription.populate([
+      { path: "user", select: "username email phoneNumber" },
+      { path: "queuedBy", select: "username email" },
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: "Subscription queued successfully",
+      data: {
+        subscription: newSubscription,
+        transaction: {
+          id: transaction._id,
+          transactionId: transaction.transactionId,
+          status: transaction.status,
+        },
+        queueInfo: {
+          position: queuePosition,
+          deviceHasActive: await Subscription.hasActiveSubscription(imei),
+          totalInQueue: await Subscription.countDocuments({
+            imei,
+            status: { $in: ["QUEUED", "PENDING"] },
+          }),
+        },
+      },
+    });
+  } catch (err) {
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    console.error("Queue subscription error:", err);
+    next(err);
+  } finally {
+    await session.endSession();
+  }
+};
+
+// Move existing subscription to queue
+const moveSubscriptionToQueue = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const { priority = 0, adminNotes = "" } = req.body;
+    const adminId = req.user._id;
+
+    const subscription = await Subscription.findById(subscriptionId).populate(
+      "user",
+      "username email"
+    );
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    // Can only queue PENDING subscriptions
+    if (subscription.status !== "PENDING") {
+      throw new CustomError(
+        400,
+        "Only pending subscriptions can be moved to queue"
+      );
+    }
+
+    // Move to queue
+    subscription.status = "QUEUED";
+    subscription.queuedBy = adminId;
+    subscription.queuedAt = new Date();
+    subscription.priority = priority;
+    if (adminNotes) {
+      subscription.adminNotes = adminNotes;
+    }
+
+    // Ensure queue position
+    if (!subscription.queuePosition) {
+      subscription.queuePosition = await Subscription.getNextQueuePosition(
+        subscription.imei
+      );
+    }
+
+    await subscription.save();
+
+    // Reorder queue
+    await Subscription.reorderDeviceQueue(subscription.imei);
+
+    // Log transaction
+    await logTransactionUpdate(
+      subscriptionId,
+      "SUBSCRIPTION_QUEUED",
+      "PENDING",
+      adminId,
+      {
+        adminNotes: `Moved to queue: ${adminNotes}`,
+        metadata: {
+          movedToQueueAt: new Date(),
+          priority: priority,
+        },
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Subscription moved to queue successfully",
+      data: {
+        subscription,
+        newQueuePosition: subscription.queuePosition,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get queue status for a device
+const getDeviceQueueStatus = async (req, res, next) => {
+  try {
+    const { imei } = req.params;
+    const { includeHistory = false } = req.query;
+
+    // Get current queue
+    const queuedSubscriptions = await Subscription.find({
+      imei,
+      status: { $in: ["QUEUED", "PENDING"] },
+    })
+      .populate("user", "username email phoneNumber")
+      .populate("queuedBy", "username email")
+      .sort({ priority: -1, queuePosition: 1 });
+
+    // Get active subscription
+    const activeSubscription = await Subscription.findOne({
+      imei,
+      status: "ACTIVE",
+    }).populate("user", "username email phoneNumber");
+
+    // Queue statistics
+    const queueStats = {
+      totalInQueue: queuedSubscriptions.length,
+      hasActiveSubscription: !!activeSubscription,
+      nextInQueue: queuedSubscriptions[0] || null,
+      estimatedWaitTime: queuedSubscriptions.length * 2, // Rough estimate: 2 days per position
+    };
+
+    let history = [];
+    if (includeHistory === "true") {
+      history = await Subscription.find({
+        imei,
+        status: { $in: ["EXPIRED", "CANCELLED", "ACTIVE"] },
+      })
+        .populate("user", "username email")
+        .sort({ createdAt: -1 })
+        .limit(10);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        imei,
+        activeSubscription,
+        queuedSubscriptions,
+        queueStats,
+        history: includeHistory === "true" ? history : undefined,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Update queue position
+const updateQueuePosition = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const { newPosition } = req.body;
+    const adminId = req.user._id;
+
+    if (!newPosition || newPosition < 1) {
+      throw new CustomError(
+        400,
+        "Valid queue position is required (must be >= 1)"
+      );
+    }
+
+    const subscription = await Subscription.findById(subscriptionId);
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    if (!["QUEUED", "PENDING"].includes(subscription.status)) {
+      throw new CustomError(
+        400,
+        "Can only update queue position for queued/pending subscriptions"
+      );
+    }
+
+    const oldPosition = parseInt(subscription.queuePosition) || 0;
+    const newPos = parseInt(newPosition);
+
+    if (oldPosition === newPos) {
+      return res.json({
+        success: true,
+        message: "Queue position unchanged",
+        data: { subscription, oldPosition, newPosition: newPos },
+      });
+    }
+
+    // Get all queued subscriptions for this device
+    const allQueued = await Subscription.find({
+      imei: subscription.imei,
+      status: { $in: ["QUEUED", "PENDING"] },
+      _id: { $ne: subscriptionId },
+    }).sort({ queuePosition: 1 });
+
+    // Validate new position
+    if (newPos > allQueued.length + 1) {
+      throw new CustomError(
+        400,
+        `Queue position cannot exceed ${allQueued.length + 1}`
+      );
+    }
+
+    // Update positions
+    if (newPos < oldPosition) {
+      // Moving up - increment positions of others
+      await Subscription.updateMany(
+        {
+          imei: subscription.imei,
+          status: { $in: ["QUEUED", "PENDING"] },
+          queuePosition: { $gte: newPos, $lt: oldPosition },
+          _id: { $ne: subscriptionId },
+        },
+        { $inc: { queuePosition: 1 } }
+      );
+    } else {
+      // Moving down - decrement positions of others
+      await Subscription.updateMany(
+        {
+          imei: subscription.imei,
+          status: { $in: ["QUEUED", "PENDING"] },
+          queuePosition: { $gt: oldPosition, $lte: newPos },
+          _id: { $ne: subscriptionId },
+        },
+        { $inc: { queuePosition: -1 } }
+      );
+    }
+
+    // Update the subscription
+    subscription.queuePosition = newPos.toString();
+    await subscription.save();
+
+    // Reorder to ensure consistency
+    await Subscription.reorderDeviceQueue(subscription.imei);
+
+    // Log transaction
+    await logTransactionUpdate(
+      subscriptionId,
+      "QUEUE_POSITION_UPDATED",
+      "PENDING",
+      adminId,
+      {
+        adminNotes: `Queue position changed from ${oldPosition} to ${newPos}`,
+        metadata: {
+          queuePositionChange: {
+            from: oldPosition,
+            to: newPos,
+            updatedAt: new Date(),
+          },
+        },
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Queue position updated successfully",
+      data: {
+        subscription,
+        oldPosition,
+        newPosition: newPos,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Bulk queue operations
+const bulkQueueOperations = async (req, res, next) => {
+  try {
+    const { operation, subscriptionIds, data = {} } = req.body;
+    const adminId = req.user._id;
+
+    if (
+      !subscriptionIds ||
+      !Array.isArray(subscriptionIds) ||
+      subscriptionIds.length === 0
+    ) {
+      throw new CustomError(400, "Subscription IDs array is required");
+    }
+
+    if (!operation) {
+      throw new CustomError(400, "Operation is required");
+    }
+
+    let results = [];
+
+    switch (operation) {
+      case "queue":
+        results = await Promise.all(
+          subscriptionIds.map(async (id) => {
+            try {
+              const sub = await Subscription.findById(id);
+              if (sub && sub.status === "PENDING") {
+                await sub.moveToQueue(
+                  adminId,
+                  data.adminNotes || "Bulk queue operation"
+                );
+                return { id, status: "queued", success: true };
+              }
+              return {
+                id,
+                status: "failed",
+                reason: "Invalid status or not found",
+                success: false,
+              };
+            } catch (error) {
+              return {
+                id,
+                status: "failed",
+                reason: error.message,
+                success: false,
+              };
+            }
+          })
+        );
+        break;
+
+      case "reorder":
+        // Reorder all queues for affected devices
+        const subscriptions = await Subscription.find({
+          _id: { $in: subscriptionIds },
+        });
+        const devices = [...new Set(subscriptions.map((sub) => sub.imei))];
+
+        for (const imei of devices) {
+          await Subscription.reorderDeviceQueue(imei);
+        }
+
+        results = subscriptionIds.map((id) => ({
+          id,
+          status: "reordered",
+          success: true,
+        }));
+        break;
+
+      case "setPriority":
+        if (typeof data.priority !== "number") {
+          throw new CustomError(400, "Priority must be a number");
+        }
+
+        await Subscription.updateMany(
+          {
+            _id: { $in: subscriptionIds },
+            status: { $in: ["QUEUED", "PENDING"] },
+          },
+          { $set: { priority: data.priority } }
+        );
+
+        results = subscriptionIds.map((id) => ({
+          id,
+          status: "priority_updated",
+          success: true,
+        }));
+        break;
+
+      default:
+        throw new CustomError(400, "Invalid operation specified");
+    }
+
+    res.json({
+      success: true,
+      message: `Bulk ${operation} completed`,
+      data: {
+        results,
+        processed: subscriptionIds.length,
+        successful: results.filter((r) => r.success).length,
+        failed: results.filter((r) => !r.success).length,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get queue dashboard/overview
+const getQueueDashboard = async (req, res, next) => {
+  try {
+    // Overall queue statistics
+    const queueStats = await Subscription.aggregate([
+      {
+        $match: { status: { $in: ["QUEUED", "PENDING"] } },
+      },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalValue: { $sum: "$price" },
+          avgPrice: { $avg: "$price" },
+        },
+      },
+    ]);
+
+    // Queue by device
+    const deviceQueues = await Subscription.aggregate([
+      {
+        $match: { status: { $in: ["QUEUED", "PENDING"] } },
+      },
+      {
+        $group: {
+          _id: "$imei",
+          queueLength: { $sum: 1 },
+          totalValue: { $sum: "$price" },
+          oldestQueued: { $min: "$queuedAt" },
+        },
+      },
+      { $sort: { queueLength: -1 } },
+    ]);
+
+    // Plan distribution in queue
+    const planDistribution = await Subscription.aggregate([
+      {
+        $match: { status: { $in: ["QUEUED", "PENDING"] } },
+      },
+      {
+        $group: {
+          _id: "$plan",
+          count: { $sum: 1 },
+          totalValue: { $sum: "$price" },
+        },
+      },
+      { $sort: { count: -1 } },
+    ]);
+
+    // Recent queue activity
+    const recentActivity = await Subscription.find({
+      queuedAt: { $exists: true },
+    })
+      .populate("user", "username email")
+      .populate("queuedBy", "username")
+      .sort({ queuedAt: -1 })
+      .limit(10)
+      .select("plan status queuePosition queuedAt user queuedBy imei");
+
+    // Active subscriptions count
+    const activeCount = await Subscription.countDocuments({ status: "ACTIVE" });
+
+    res.json({
+      success: true,
+      data: {
+        overview: {
+          totalQueued: queueStats.reduce((sum, stat) => sum + stat.count, 0),
+          totalValue: queueStats.reduce(
+            (sum, stat) => sum + stat.totalValue,
+            0
+          ),
+          activeSubscriptions: activeCount,
+          devicesWithQueues: deviceQueues.length,
+        },
+        queueStats,
+        deviceQueues: deviceQueues.slice(0, 20), // Top 20 devices
+        planDistribution,
+        recentActivity,
+        lastUpdated: new Date(),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
 
 module.exports = {
   getPendingSubscriptions,
@@ -888,4 +1402,10 @@ module.exports = {
   bulkUpdateSubscriptions,
   getAdminDashboard,
   logTransactionUpdate,
+
+  queueSubscriptionForUser,
+  moveSubscriptionToQueue,
+  getDeviceQueueStatus,
+  bulkQueueOperations,
+  getQueueDashboard,
 };

@@ -11,7 +11,7 @@ const errorHandler = require("./middleware/errorHandler");
 const CustomError = require("./utils/customError");
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/user");
-// const eventRoutes = require("./routes/event");
+const subscriptionRoutes = require("./routes/subscription");
 // const genericUserRoutes = require("./routes/genericUser");
 // const ipRoutes = require("./routes/ip");
 // const jarradTicketRoutes = require("./routes/jarradTicket");
@@ -83,7 +83,7 @@ connectDB();
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
-// app.use("/api/events", eventRoutes);
+app.use("/api/subscriptions", subscriptionRoutes);
 // app.use("/api/generic-user", genericUserRoutes);
 // app.use("/api/ip", ipRoutes);
 // app.use("/api/jarrad-ticket", jarradTicketRoutes);

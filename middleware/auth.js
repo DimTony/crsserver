@@ -30,7 +30,7 @@ const auth = async (req, res, next) => {
     // console.log("[Auth SERVER]:", authHeader);
 
     if (!authHeader) {
-      throw new CustomError(401, "No authentication token provided");
+      throw new CustomError(401, "Unauthorized user");
     }
 
     // Check token format
