@@ -318,7 +318,7 @@ const activateSubscription = async (req, res, next) => {
       throw new CustomError(400, "Invalid OTP");
     }
 
-    const subscriptionType = subscription.subscriptionType;
+    const subscriptionType = subscription.plan;
     const durationInDays = SUBSCRIPTION_TYPES[subscriptionType];
 
     if (!durationInDays) {
