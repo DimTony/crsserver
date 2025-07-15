@@ -18,8 +18,8 @@ const TransactionSchema = new mongoose.Schema(
     },
     device: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "Device",
-      required: true,
+      // ref: "Device",
+      // required: true,
     },
     
     // Transaction Details
@@ -37,6 +37,7 @@ const TransactionSchema = new mongoose.Schema(
         "SUBSCRIPTION_CANCELLED",
         "SUBSCRIPTION_EXPIRED",
         "SUBSCRIPTION_REFUNDED",
+        "SUBSCRIPTION_RENEWAL",
         "SUBSCRIPTION_UPGRADED",
         "SUBSCRIPTION_DOWNGRADED",
         "PAYMENT_PENDING",

@@ -11,7 +11,6 @@ const {
 } = require("../utils/helpers");
 const CustomError = require("../utils/customError");
 
-
 const SUBSCRIPTION_TYPES = {
   "mobile-v4-basic": 30,
   "mobile-v4-premium": 60,
@@ -194,12 +193,10 @@ const queueSubscription = async (req, res, next) => {
 
     await session.startTransaction();
 
-    
-
     const updatedSubscription = await Subscription.findByIdAndUpdate(
       subscriptionId,
       {
-        status: 'QUEUED',
+        status: "QUEUED",
         updatedAt: now,
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -261,7 +258,7 @@ const queueSubscription = async (req, res, next) => {
     // End session
     await session.endSession();
   }
-}
+};
 
 const activateSubscription = async (req, res, next) => {
   console.log("[activateSubscription SERVER]:", req.body);
@@ -277,7 +274,9 @@ const activateSubscription = async (req, res, next) => {
 
     await session.startTransaction();
 
-    const subscription = await Subscription.findById(subscriptionId).session(session);
+    const subscription = await Subscription.findById(subscriptionId).session(
+      session
+    );
 
     if (!subscription) {
       throw new CustomError(404, "Subscription not found");
@@ -668,6 +667,404 @@ const renewSubscription = async (req, res, next) => {
   }
 };
 
+const renewActiveSubscription = async (req, res, next) => {
+  console.log("[renewActiveSubscription SERVER]:", req.body);
+  const {
+    subscriptionId,
+    newPlan,
+    paymentMethod = "ADMIN_APPROVAL",
+  } = req.body;
+  const userId = req.user._id;
+
+  const session = await mongoose.startSession();
+
+  try {
+    if (!subscriptionId || !newPlan) {
+      throw new CustomError(400, "Please provide subscriptionId and newPlan");
+    }
+
+    await session.startTransaction();
+
+    // Find the active subscription
+    const subscription = await Subscription.findById(subscriptionId).session(
+      session
+    );
+
+    console.log("HHH", subscription);
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    // Verify ownership
+    if (subscription.user.toString() !== userId.toString()) {
+      throw new CustomError(403, "Unauthorized access to subscription");
+    }
+
+    // Check if subscription is active
+    if (subscription.status !== "ACTIVE") {
+      throw new CustomError(400, "Only active subscriptions can be renewed");
+    }
+
+    // Get current plan details
+    const currentPlan = subscription.plan;
+    const currentEndDate = subscription.endDate;
+    const now = new Date();
+
+    // Calculate remaining days on current subscription
+    const remainingMs = currentEndDate.getTime() - now.getTime();
+    const remainingDays = Math.max(
+      0,
+      Math.ceil(remainingMs / (1000 * 60 * 60 * 24))
+    );
+
+    // Get new plan duration and price
+    const newPlanDuration = getSubscriptionDuration(newPlan);
+    const newPlanPrice = getSubscriptionPrice(newPlan);
+
+    // Calculate new end date (current end date + new plan duration)
+    const newEndDate = new Date(currentEndDate);
+    newEndDate.setDate(newEndDate.getDate() + newPlanDuration);
+
+    // Create renewal transaction
+    const renewalTransaction = new Transaction({
+      user: userId,
+      subscription: subscriptionId,
+      device: subscription.device || undefined, // Fix: use proper device ObjectId or undefined
+      transactionId: Transaction.generateTransactionId(),
+      type: "SUBSCRIPTION_RENEWAL",
+      amount: newPlanPrice,
+      plan: newPlan,
+      status: "COMPLETED", // Mark as completed for admin approval method
+      paymentMethod,
+      processedAt: new Date(),
+      subscriptionPeriod: {
+        startDate: currentEndDate, // Renewal starts when current subscription ends
+        endDate: newEndDate,
+        duration: newPlanDuration,
+      },
+      metadata: {
+        userAgent: req.get("User-Agent") || "Unknown",
+        ipAddress: req.ip || "Unknown",
+        previousPlan: currentPlan,
+        newPlan: newPlan,
+        remainingDaysOnRenewal: remainingDays,
+        renewalType: "EXTENSION", // This is an extension, not replacement
+        deviceInfo: {
+          imei: subscription.imei,
+          deviceName: subscription.deviceName,
+        },
+      },
+    });
+
+    await renewalTransaction.save({ session });
+
+    // Update subscription with renewal details
+    subscription.endDate = newEndDate;
+    subscription.plan = newPlan; // Update to new plan
+    subscription.price = newPlanPrice; // Update to new plan price
+    subscription.updatedAt = now;
+
+    // Add renewal history to subscription (optional)
+    if (!subscription.renewalHistory) {
+      subscription.renewalHistory = [];
+    }
+
+    subscription.renewalHistory.push({
+      renewedAt: now,
+      previousPlan: currentPlan,
+      newPlan: newPlan,
+      addedDuration: newPlanDuration,
+      transactionId: renewalTransaction.transactionId,
+      remainingDaysAtRenewal: remainingDays,
+    });
+
+    await subscription.save({ session });
+
+    await session.commitTransaction();
+
+    // Populate response data
+    await subscription.populate([
+      { path: "user", select: "username email phoneNumber" },
+    ]);
+
+    res.json({
+      success: true,
+      message: "Subscription renewed successfully",
+      data: {
+        subscription: {
+          id: subscription._id,
+          plan: subscription.plan,
+          status: subscription.status,
+          startDate: subscription.startDate,
+          endDate: subscription.endDate,
+          price: subscription.price,
+          renewalDetails: {
+            renewedAt: now,
+            previousPlan: currentPlan,
+            newPlan: newPlan,
+            addedDuration: newPlanDuration,
+            remainingDaysAtRenewal: remainingDays,
+            newEndDate: newEndDate,
+          },
+        },
+        transaction: {
+          id: renewalTransaction._id,
+          transactionId: renewalTransaction.transactionId,
+          amount: renewalTransaction.amount,
+          status: renewalTransaction.status,
+          type: renewalTransaction.type,
+        },
+        summary: {
+          planChanged: currentPlan !== newPlan,
+          durationAdded: `${newPlanDuration} days`,
+          totalRemainingDays: Math.ceil(
+            (newEndDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+          ),
+          renewalCost: newPlanPrice,
+        },
+      },
+    });
+  } catch (err) {
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Subscription renewal error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Subscription renewal failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    await session.endSession();
+  }
+};
+
+// Get subscription renewal options and pricing
+const getRenewalOptions = async (req, res, next) => {
+  try {
+    const subscriptionId = req.params.id;
+    const userId = req.user._id;
+
+    const subscription = await Subscription.findById(subscriptionId);
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    if (subscription.user.toString() !== userId.toString()) {
+      throw new CustomError(403, "Unauthorized access to subscription");
+    }
+
+    if (subscription.status !== "ACTIVE") {
+      throw new CustomError(400, "Only active subscriptions can be renewed");
+    }
+
+    const currentPlan = subscription.plan;
+    const currentEndDate = subscription.endDate;
+    const now = new Date();
+
+    // Calculate remaining time
+    const remainingMs = currentEndDate.getTime() - now.getTime();
+    const remainingDays = Math.max(
+      0,
+      Math.ceil(remainingMs / (1000 * 60 * 60 * 24))
+    );
+
+    // Available renewal plans
+    const availablePlans = [
+      "mobile-v4-basic",
+      "mobile-v4-premium",
+      "mobile-v4-enterprise",
+      "mobile-v5-basic",
+      "mobile-v5-premium",
+      "full-suite-basic",
+      "full-suite-premium",
+    ];
+
+    const renewalOptions = availablePlans.map((plan) => {
+      const duration = getSubscriptionDuration(plan);
+      const price = getSubscriptionPrice(plan);
+      const newEndDate = new Date(currentEndDate);
+      newEndDate.setDate(newEndDate.getDate() + duration);
+
+      return {
+        plan,
+        duration: `${duration} days`,
+        price,
+        newEndDate,
+        totalDaysAfterRenewal: Math.ceil(
+          (newEndDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+        ),
+        isCurrentPlan: plan === currentPlan,
+        recommended:
+          plan === currentPlan ||
+          (plan.includes("premium") && !currentPlan.includes("enterprise")),
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        currentSubscription: {
+          id: subscription._id,
+          plan: currentPlan,
+          endDate: currentEndDate,
+          remainingDays,
+          status: subscription.status,
+        },
+        renewalOptions,
+        summary: {
+          currentPlanPrice: getSubscriptionPrice(currentPlan),
+          currentPlanDuration: getSubscriptionDuration(currentPlan),
+          canRenew: true,
+          renewalMessage: `Your subscription will be extended from ${currentEndDate.toLocaleDateString()} by the duration of your chosen plan.`,
+        },
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get subscription renewal history
+const getRenewalHistory = async (req, res, next) => {
+  try {
+    const { subscriptionId } = req.params;
+    const userId = req.user._id;
+
+    const subscription = await Subscription.findById(subscriptionId);
+
+    if (!subscription) {
+      throw new CustomError(404, "Subscription not found");
+    }
+
+    if (subscription.user.toString() !== userId.toString()) {
+      throw new CustomError(403, "Unauthorized access to subscription");
+    }
+
+    // Get all renewal transactions for this subscription
+    const renewalTransactions = await Transaction.find({
+      subscription: subscriptionId,
+      type: "SUBSCRIPTION_RENEWED",
+    })
+      .sort({ createdAt: -1 })
+      .limit(20);
+
+    const renewalHistory = renewalTransactions.map((tx) => ({
+      transactionId: tx.transactionId,
+      renewedAt: tx.createdAt,
+      plan: tx.plan,
+      amount: tx.amount,
+      duration:
+        tx.subscriptionPeriod?.duration || getSubscriptionDuration(tx.plan),
+      status: tx.status,
+      previousPlan: tx.metadata?.previousPlan,
+      addedDuration:
+        tx.metadata?.addedDuration || getSubscriptionDuration(tx.plan),
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        subscription: {
+          id: subscription._id,
+          currentPlan: subscription.plan,
+          status: subscription.status,
+          endDate: subscription.endDate,
+        },
+        renewalHistory,
+        summary: {
+          totalRenewals: renewalHistory.length,
+          totalSpentOnRenewals: renewalHistory.reduce(
+            (sum, renewal) => sum + renewal.amount,
+            0
+          ),
+          latestRenewal: renewalHistory[0] || null,
+        },
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// models/subscription.js - Add this to the existing subscription schema
+
+// Add these fields to the SubscriptionSchema:
+/*
+    // Renewal tracking fields (add these to existing schema)
+    renewalHistory: [{
+      renewedAt: {
+        type: Date,
+        default: Date.now,
+      },
+      previousPlan: {
+        type: String,
+        required: true,
+      },
+      newPlan: {
+        type: String,
+        required: true,
+      },
+      addedDuration: {
+        type: Number, // days
+        required: true,
+      },
+      transactionId: {
+        type: String,
+        required: true,
+      },
+      remainingDaysAtRenewal: {
+        type: Number,
+        default: 0,
+      },
+    }],
+    
+    // Track last renewal
+    lastRenewalDate: {
+      type: Date,
+    },
+    
+    // Count of renewals
+    renewalCount: {
+      type: Number,
+      default: 0,
+    },
+*/
+
+// routes/subscription.js - Add these routes to the existing router
+
+/*
+// Add these routes to your existing subscription routes:
+
+// Renewal management
+router.get("/:id/renewal-options", getRenewalOptions);
+router.post("/:id/renew", renewActiveSubscription);
+router.get("/:id/renewal-history", getRenewalHistory);
+*/
+
 module.exports = {
   upgradeSubscription,
   downgradeSubscription,
@@ -676,4 +1073,8 @@ module.exports = {
   checkDeviceIsOnboarded,
   setupDeviceOtp,
   activateSubscription,
+
+  renewActiveSubscription,
+  getRenewalOptions,
+  getRenewalHistory,
 };

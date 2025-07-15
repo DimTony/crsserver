@@ -10,7 +10,13 @@
     "admin:promote": "node scripts/admin.js promote",
     "admin:list": "node scripts/admin.js list",
     "db:migrate": "node scripts/dbmigrate.js",
-    "setup": "npm run db:migrate && npm run admin:create"
+    "setup": "npm run db:migrate && npm run admin:create",
+    "renewal:add-fields": "node scripts/addRenewalFields.js add-fields",
+    "renewal:cleanup": "node scripts/addRenewalFields.js cleanup",
+    "renewal:validate": "node scripts/addRenewalFields.js validate",
+    "renewal:fix": "node scripts/addRenewalFields.js fix",
+    "renewal:status": "node scripts/addRenewalFields.js status",
+    "renewal:migrate": "npm run renewal:add-fields && npm run renewal:validate"
   },
   "dependencies": {
     "@faker-js/faker": "^8.4.1",

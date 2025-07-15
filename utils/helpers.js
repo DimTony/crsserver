@@ -1,12 +1,12 @@
 function  getSubscriptionPrice(subscriptionType) {
   const SUBSCRIPTION_PRICES = {
-    "mobile-v4-basic": 29.99,
-    "mobile-v4-premium": 49.99,
-    "mobile-v4-enterprise": 99.99,
-    "mobile-v5-basic": 39.99,
-    "mobile-v5-premium": 59.99,
-    "full-suite-basic": 79.99,
-    "full-suite-premium": 149.99,
+    "mobile-v4-basic": 1249.99,
+    "mobile-v4-premium": 1419.49,
+    "mobile-v4-enterprise": 1999.99,
+    "mobile-v5-basic": 2339.49,
+    "mobile-v5-premium": 2629.99,
+    "full-suite-basic": 2789.99,
+    "full-suite-premium": 3149.49,
   };
 
   return SUBSCRIPTION_PRICES[subscriptionType] || 29.99;

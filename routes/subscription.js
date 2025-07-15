@@ -11,7 +11,11 @@ const {
   checkDeviceIsOnboarded,
   setupDeviceOtp,
   activateSubscription,
+  renewActiveSubscription,
+  getRenewalOptions,
+  getRenewalHistory,
 } = require("../controllers/subscriptionController");
+
 
 // All routes require authentication
 router.use(auth);
@@ -20,6 +24,11 @@ router.use(auth);
 router.post("/check-device", checkDeviceIsOnboarded);
 router.post("/setup", setupDeviceOtp);
 router.post("/activate", activateSubscription);
+
+// Subscription renewal endpoints
+router.get("/:id/renewal-options", getRenewalOptions);
+router.post("/:id/renew", renewActiveSubscription);
+router.get("/:id/renewal-history", getRenewalHistory);
 
 // // Subscription management
 // router.post("/:id/upgrade", upgradeSubscription);

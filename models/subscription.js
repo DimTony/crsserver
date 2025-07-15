@@ -1,4 +1,4 @@
-// models/subscription.js - Updated with QUEUED status
+// models/subscription.js - Updated with renewal tracking fields
 const mongoose = require("mongoose");
 
 const SubscriptionSchema = new mongoose.Schema(
@@ -91,6 +91,58 @@ const SubscriptionSchema = new mongoose.Schema(
       type: Number,
       default: 0, // Higher number = higher priority
     },
+
+    // NEW: Renewal tracking fields
+    renewalHistory: [
+      {
+        renewedAt: {
+          type: Date,
+          default: Date.now,
+        },
+        previousPlan: {
+          type: String,
+          required: true,
+        },
+        newPlan: {
+          type: String,
+          required: true,
+        },
+        addedDuration: {
+          type: Number, // days
+          required: true,
+        },
+        transactionId: {
+          type: String,
+          required: true,
+        },
+        remainingDaysAtRenewal: {
+          type: Number,
+          default: 0,
+        },
+      },
+    ],
+
+    // Track last renewal
+    lastRenewalDate: {
+      type: Date,
+    },
+
+    // Count of renewals
+    renewalCount: {
+      type: Number,
+      default: 0,
+    },
+
+    // Track total subscription value
+    totalPaid: {
+      type: Number,
+      default: 0,
+    },
+
+    // Original subscription duration for reference
+    originalDuration: {
+      type: Number, // days
+    },
   },
   { versionKey: false, timestamps: true }
 );
@@ -98,6 +150,7 @@ const SubscriptionSchema = new mongoose.Schema(
 // Index for efficient queue queries
 SubscriptionSchema.index({ imei: 1, status: 1, queuePosition: 1 });
 SubscriptionSchema.index({ status: 1, queuePosition: 1 });
+SubscriptionSchema.index({ user: 1, status: 1 });
 
 // Static method to get next queue position for a device
 SubscriptionSchema.statics.getNextQueuePosition = async function (imei) {
@@ -152,6 +205,56 @@ SubscriptionSchema.methods.moveToQueue = async function (adminId, notes = "") {
   }
 
   return await this.save();
+};
+
+// NEW: Instance method to process renewal
+SubscriptionSchema.methods.renewSubscription = async function (
+  newPlan,
+  addedDuration,
+  transactionId
+) {
+  const now = new Date();
+  const currentEndDate = this.endDate || now;
+
+  // Calculate remaining days
+  const remainingMs = Math.max(0, currentEndDate.getTime() - now.getTime());
+  const remainingDays = Math.ceil(remainingMs / (1000 * 60 * 60 * 24));
+
+  // Add renewal to history
+  this.renewalHistory.push({
+    renewedAt: now,
+    previousPlan: this.plan,
+    newPlan: newPlan,
+    addedDuration: addedDuration,
+    transactionId: transactionId,
+    remainingDaysAtRenewal: remainingDays,
+  });
+
+  // Update subscription details
+  this.plan = newPlan;
+  this.endDate = new Date(
+    currentEndDate.getTime() + addedDuration * 24 * 60 * 60 * 1000
+  );
+  this.lastRenewalDate = now;
+  this.renewalCount = (this.renewalCount || 0) + 1;
+
+  return await this.save();
+};
+
+// NEW: Method to calculate total days remaining
+SubscriptionSchema.methods.getDaysRemaining = function () {
+  if (!this.endDate || this.status !== "ACTIVE") {
+    return 0;
+  }
+
+  const now = new Date();
+  const remainingMs = Math.max(0, this.endDate.getTime() - now.getTime());
+  return Math.ceil(remainingMs / (1000 * 60 * 60 * 24));
+};
+
+// NEW: Method to check if subscription is eligible for renewal
+SubscriptionSchema.methods.isEligibleForRenewal = function () {
+  return this.status === "ACTIVE" && this.endDate && this.endDate > new Date();
 };
 
 module.exports = mongoose.model("Subscription", SubscriptionSchema);
