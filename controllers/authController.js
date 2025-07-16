@@ -177,7 +177,8 @@ const register = async (req, res, next) => {
 
     // Check for active subscriptions on phone number
     const hasActiveSubscription = await Subscription.findOne({
-      phone: phoneNumber,
+      // phone: phoneNumber,
+      imei,
       status: "ACTIVE",
     }).session(session);
 
@@ -185,7 +186,7 @@ const register = async (req, res, next) => {
       await session.abortTransaction();
       throw new CustomError(
         400,
-        "Phone number already has an active subscription"
+        "Device already has an active subscription"
       );
     }
 
@@ -936,7 +937,7 @@ const login = async (req, res, next) => {
 
     // Sign tokens
     const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: "1h",
+      expiresIn: "12h",
     });
 
     const refreshToken = jwt.sign(payload, process.env.REFRESH_SECRET, {

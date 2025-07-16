@@ -14,7 +14,11 @@ const {
   renewActiveSubscription,
   getRenewalOptions,
   getRenewalHistory,
+  newSubscription,
+  addDeviceSubscription,
+  addSubscriptionToMyDevice,
 } = require("../controllers/subscriptionController");
+const { cloudinaryUploadMiddleware } = require("../config/fileHandler");
 
 
 // All routes require authentication
@@ -24,6 +28,9 @@ router.use(auth);
 router.post("/check-device", checkDeviceIsOnboarded);
 router.post("/setup", setupDeviceOtp);
 router.post("/activate", activateSubscription);
+router.post("/new-device", cloudinaryUploadMiddleware, addDeviceSubscription);
+router.post("/new", cloudinaryUploadMiddleware, addSubscriptionToMyDevice);
+
 
 // Subscription renewal endpoints
 router.get("/:id/renewal-options", getRenewalOptions);

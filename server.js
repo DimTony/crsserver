@@ -12,7 +12,7 @@ const CustomError = require("./utils/customError");
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/user");
 const subscriptionRoutes = require("./routes/subscription");
-// const genericUserRoutes = require("./routes/genericUser");
+const deviceRoutes = require("./routes/device");
 // const ipRoutes = require("./routes/ip");
 // const jarradTicketRoutes = require("./routes/jarradTicket");
 // const jarradWrigleyRoutes = require("./routes/jarradWrigley");
@@ -60,7 +60,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(helmet());
 
-
 app.use(logger("dev"));
 
 // Setup socket handlers
@@ -84,7 +83,7 @@ connectDB();
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
-// app.use("/api/generic-user", genericUserRoutes);
+app.use("/api/devices", deviceRoutes);
 // app.use("/api/ip", ipRoutes);
 // app.use("/api/jarrad-ticket", jarradTicketRoutes);
 // app.use("/api/jarrad-wrigley", jarradWrigleyRoutes);
