@@ -445,19 +445,21 @@ const addDeviceSubscription = async (req, res, next) => {
   console.log("[ADD DEVICE SUBSCRIPTION]:", req.user);
 
   const {
-    username,
-    email,
-    password,
     deviceName,
     imei,
-    phoneNumber,
     plan,
     files,
+    // username,
+    // email,
+    password,
+    phoneNumber,
     submissionNotes,
     createNewUser = false, // Flag to determine if we should create a new user
     // userId, // For existing users
   } = req.body;
   const userId = req.user._id;
+  const username = req.user.username;
+  const email = req.user.email;
 
   // Extract request metadata for transaction logging
   const requestMetadata = extractRequestMetadata(req);
@@ -1159,7 +1161,6 @@ const addSubscriptionToExtendExistingSubscription = async (req, res, next) => {
     await session.endSession();
   }
 };
-
 
 const addSubscriptionToMyDevice = async (req, res, next) => {
   console.log("[addSubscriptionToMyDevice SERVER]:", req.body);
