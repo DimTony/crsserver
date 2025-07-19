@@ -21,7 +21,7 @@ const TransactionSchema = new mongoose.Schema(
       // ref: "Device",
       // required: true,
     },
-    
+
     // Transaction Details
     transactionId: {
       type: String,
@@ -33,27 +33,35 @@ const TransactionSchema = new mongoose.Schema(
       type: String,
       enum: [
         "SUBSCRIPTION_CREATED",
-        "SUBSCRIPTION_ACTIVATED", 
+        "SUBSCRIPTION_ACTIVATED",
         "SUBSCRIPTION_CANCELLED",
         "SUBSCRIPTION_EXPIRED",
+        "SUBSCRIPTION_QUEUED",
         "SUBSCRIPTION_REFUNDED",
         "SUBSCRIPTION_RENEWAL",
         "SUBSCRIPTION_UPGRADED",
         "SUBSCRIPTION_DOWNGRADED",
         "PAYMENT_PENDING",
         "PAYMENT_COMPLETED",
-        "PAYMENT_FAILED"
+        "PAYMENT_FAILED",
       ],
       required: true,
       index: true,
     },
     status: {
       type: String,
-      enum: ["PENDING", "COMPLETED", "FAILED", "CANCELLED", "REFUNDED"],
+      enum: [
+        "PENDING",
+        "QUEUED",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "REFUNDED",
+      ],
       default: "PENDING",
       index: true,
     },
-    
+
     // Financial Information
     amount: {
       type: Number,
@@ -70,11 +78,18 @@ const TransactionSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
-    
+
     // Payment Information
     paymentMethod: {
       type: String,
-      enum: ["ADMIN_APPROVAL", "CREDIT_CARD", "BANK_TRANSFER", "PAYPAL", "CRYPTO", "FREE_TRIAL"],
+      enum: [
+        "ADMIN_APPROVAL",
+        "CREDIT_CARD",
+        "BANK_TRANSFER",
+        "PAYPAL",
+        "CRYPTO",
+        "FREE_TRIAL",
+      ],
       default: "ADMIN_APPROVAL",
     },
     paymentProvider: {
@@ -84,14 +99,14 @@ const TransactionSchema = new mongoose.Schema(
       type: String, // ID from payment provider
       index: true,
     },
-    
+
     // Subscription Period
     subscriptionPeriod: {
       startDate: Date,
       endDate: Date,
       duration: Number, // in days
     },
-    
+
     // Admin Actions (for admin-processed transactions)
     processedBy: {
       type: String,
@@ -103,7 +118,7 @@ const TransactionSchema = new mongoose.Schema(
     adminNotes: {
       type: String,
     },
-    
+
     // Queue Information (for subscription creation)
     queuePosition: {
       type: String,
@@ -114,7 +129,7 @@ const TransactionSchema = new mongoose.Schema(
     approvedAt: {
       type: Date,
     },
-    
+
     // Transaction Metadata
     metadata: {
       userAgent: String,
@@ -128,24 +143,26 @@ const TransactionSchema = new mongoose.Schema(
       phoneNumber: String,
       email: String,
     },
-    
+
     // Audit Trail
     previousTransaction: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Transaction",
     },
-    relatedTransactions: [{
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Transaction",
-    }],
-    
+    relatedTransactions: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Transaction",
+      },
+    ],
+
     // Error Information (for failed transactions)
     errorDetails: {
       code: String,
       message: String,
       stackTrace: String,
     },
-    
+
     // Timestamps
     initiatedAt: {
       type: Date,
@@ -158,8 +175,8 @@ const TransactionSchema = new mongoose.Schema(
       type: Date,
     },
   },
-  { 
-    versionKey: false, 
+  {
+    versionKey: false,
     timestamps: true,
     // Add compound indexes for common queries
     indexes: [
@@ -169,7 +186,7 @@ const TransactionSchema = new mongoose.Schema(
       { type: 1, createdAt: -1 },
       { transactionId: 1 },
       { externalTransactionId: 1 },
-    ]
+    ],
   }
 );
 

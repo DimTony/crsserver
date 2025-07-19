@@ -1,16 +1,25 @@
-// controllers/adminController.js - Updated without SubscriptionQueue
-const Subscription = require("../models/subscription");
+const mongoose = require("mongoose");
+const speakeasy = require("speakeasy");
+const QRCode = require("qrcode");
+const jwt = require("jsonwebtoken");
 const Transaction = require("../models/transaction");
-const User = require("../models/user");
 const Device = require("../models/device");
-const CustomError = require("../utils/customError");
-const { getSubscriptionDuration } = require("../utils/helpers");
+const Subscription = require("../models/subscription");
+const User = require("../models/user");
 const {
+  getSubscriptionPrice,
+  getSubscriptionDuration,
+} = require("../utils/helpers");
+const {
+  generateVerificationToken,
+  sendVerificationEmail,
+  sendWelcomeEmail,
+  sendSubscriptionQueuedEmail,
   sendSubscriptionApprovedEmail,
   sendSubscriptionRejectedEmail,
 } = require("../config/emailService");
+const CustomError = require("../utils/customError");
 
-// Get all pending subscriptions for admin review
 const getPendingSubscriptions = async (req, res, next) => {
   try {
     const {
@@ -174,47 +183,34 @@ const getSubscriptionDetails = async (req, res, next) => {
 
 // Approve a subscription
 const approveSubscription = async (req, res, next) => {
+  const session = await mongoose.startSession();
+
   try {
     const { id } = req.params;
     const { comments, activateNow = false } = req.body;
     const adminId = req.user._id;
 
-    const subscription = await Subscription.findById(id).populate(
-      "user",
-      "username email"
-    );
+    // Start database transaction for atomicity
+    await session.startTransaction();
+
+    const subscription = await Subscription.findById(id)
+      .populate("user", "username email")
+      .session(session);
 
     if (!subscription) {
+      await session.abortTransaction();
       throw new CustomError(404, "Subscription not found");
     }
 
     if (subscription.status !== "PENDING") {
+      await session.abortTransaction();
       throw new CustomError(400, "Only pending subscriptions can be approved");
     }
 
-    // Check if user already has an active subscription
-    const existingActive = await Subscription.findOne({
-      user: subscription.user._id,
-      status: "ACTIVE",
-      _id: { $ne: id },
-    });
+    // Store original status for logging
+    const originalStatus = subscription.status;
 
-    if (existingActive) {
-      throw new CustomError(400, "User already has an active subscription");
-    }
-
-    // Check if device already has an active subscription
-    const deviceActive = await Subscription.findOne({
-      imei: subscription.imei,
-      status: "ACTIVE",
-      _id: { $ne: id },
-    });
-
-    if (deviceActive) {
-      throw new CustomError(400, "Device already has an active subscription");
-    }
-
-    // Update subscription
+    // Update subscription within transaction
     if (activateNow) {
       // Activate immediately
       const subscriptionDuration = getSubscriptionDuration(subscription.plan);
@@ -225,42 +221,58 @@ const approveSubscription = async (req, res, next) => {
       );
     } else {
       // Mark as approved but not active (user needs to activate)
-      subscription.status = "APPROVED";
+      subscription.status = "QUEUED";
     }
 
     subscription.adminNotes = comments;
     subscription.reviewedBy = adminId;
     subscription.reviewedAt = new Date();
 
-    await subscription.save();
+    await subscription.save({ session });
 
-    // Log transaction
+    // Log transaction within the same database transaction
     const transactionType = activateNow
       ? "SUBSCRIPTION_ACTIVATED"
-      : "SUBSCRIPTION_APPROVED";
-    const transactionStatus = activateNow ? "COMPLETED" : "PENDING";
+      : "SUBSCRIPTION_QUEUED";
+    const transactionStatus = activateNow ? "COMPLETED" : "QUEUED";
 
-    await logTransactionUpdate(
-      id,
-      transactionType,
-      transactionStatus,
-      adminId,
-      {
-        adminNotes: comments,
-        metadata: {
-          approvedAt: new Date(),
-          activatedImmediately: activateNow,
-        },
-        subscriptionPeriod: activateNow
-          ? {
-              startDate: subscription.startDate,
-              endDate: subscription.endDate,
-            }
-          : undefined,
-      }
+    try {
+      await logTransactionUpdate(
+        id,
+        transactionType,
+        transactionStatus,
+        adminId,
+        {
+          adminNotes: comments,
+          metadata: {
+            approvedAt: new Date(),
+            activatedImmediately: activateNow,
+            originalStatus: originalStatus,
+            approvedBy: adminId,
+          },
+          subscriptionPeriod: activateNow
+            ? {
+                startDate: subscription.startDate,
+                endDate: subscription.endDate,
+              }
+            : undefined,
+        }
+      );
+    } catch (transactionLogError) {
+      console.error("Failed to log transaction update:", transactionLogError);
+      // Don't fail the entire operation for transaction logging issues
+      // But log the error for monitoring
+    }
+
+    // If we reach this point, commit the transaction
+    await session.commitTransaction();
+    console.log(
+      `✅ Subscription ${id} ${
+        activateNow ? "activated" : "queued"
+      } successfully`
     );
 
-    // Send email notification
+    // Send email notification (outside transaction to avoid rollback on email failure)
     try {
       if (activateNow) {
         // Send activation confirmation email
@@ -270,6 +282,7 @@ const approveSubscription = async (req, res, next) => {
           subscription.plan,
           null // No activation token needed since it's already active
         );
+        console.log(`✅ Activation email sent to ${subscription.user.email}`);
       } else {
         // Send approval email with activation instructions
         await sendSubscriptionApprovedEmail(
@@ -278,23 +291,80 @@ const approveSubscription = async (req, res, next) => {
           subscription.plan,
           subscription._id // Can use subscription ID for activation
         );
+        console.log(`✅ Approval email sent to ${subscription.user.email}`);
       }
     } catch (emailError) {
       console.error("Failed to send approval email:", emailError);
+      // Email failure shouldn't affect the approval process
+      // The subscription is still approved/activated successfully
     }
+
+    // Prepare response data
+    const responseData = {
+      subscription: {
+        id: subscription._id,
+        plan: subscription.plan,
+        status: subscription.status,
+        startDate: subscription.startDate,
+        endDate: subscription.endDate,
+        queuePosition: subscription.queuePosition,
+        reviewedBy: subscription.reviewedBy,
+        reviewedAt: subscription.reviewedAt,
+        adminNotes: subscription.adminNotes,
+      },
+      user: {
+        id: subscription.user._id,
+        username: subscription.user.username,
+        email: subscription.user.email,
+      },
+      activatedImmediately: activateNow,
+      approvalDate: new Date(),
+    };
 
     res.json({
       success: true,
       message: `Subscription ${
-        activateNow ? "approved and activated" : "approved"
+        activateNow
+          ? "approved and activated"
+          : "approved and queued for user activation"
       } successfully`,
-      data: {
-        subscription,
-        activatedImmediately: activateNow,
-      },
+      data: responseData,
     });
   } catch (err) {
-    next(err);
+    // Rollback transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("Subscription approval error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === 11000) {
+      // Handle duplicate key errors if any
+      next(new CustomError(400, "Duplicate entry detected"));
+    } else {
+      next(
+        new CustomError(
+          500,
+          "Subscription approval failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // Always end the session
+    await session.endSession();
   }
 };
 

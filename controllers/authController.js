@@ -1080,7 +1080,7 @@ const resendVerificationEmail = async (req, res, next) => {
 };
 
 // Updated getUser function
-const getUser = async (req, res, next) => {
+const getUserOld = async (req, res, next) => {
   try {
     let user = await User.findById(req.user._id).select(
       "-password -emailVerificationToken -encryptionCards"
@@ -1147,6 +1147,121 @@ const getUser = async (req, res, next) => {
     // Attach related data
     user.devices = devices;
     user.subscriptions = subscriptions;
+    user.transactionHistory = transactionHistory;
+    user.transactionStats = transactionStats;
+    user.totalSpent = totalSpent[0]?.totalAmount || 0;
+    user.completedTransactions = totalSpent[0]?.completedTransactions || 0;
+
+    res.json({
+      success: true,
+      message: "User fetched successfully",
+      data: user,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getUser = async (req, res, next) => {
+  try {
+    let user = await User.findById(req.user._id).select(
+      "-password -emailVerificationToken -encryptionCards"
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Get user's devices
+    const devices = await Device.find({ user: req.user._id });
+
+    // Get user's subscriptions with custom sorting
+    // Priority order: ACTIVE → QUEUED → PENDING, then by queue position within each status
+    const subscriptions = await Subscription.find({
+      user: req.user._id,
+    })
+      .select("-cards")
+      .sort({
+        // Custom sort: ACTIVE first, then QUEUED, then PENDING
+        status: 1, // This will be overridden by our custom sorting logic
+        queuePosition: 1, // Within same status, sort by queue position
+      });
+
+    // Custom sort subscriptions according to your requirements
+    const sortedSubscriptions = subscriptions.sort((a, b) => {
+      // Define status priority (lower number = higher priority)
+      const statusPriority = {
+        ACTIVE: 1,
+        QUEUED: 2,
+        PENDING: 3,
+        APPROVED: 4,
+        EXPIRED: 5,
+        CANCELLED: 6,
+      };
+
+      // First, sort by status priority
+      const statusDiff =
+        (statusPriority[a.status] || 999) - (statusPriority[b.status] || 999);
+      if (statusDiff !== 0) {
+        return statusDiff;
+      }
+
+      // If same status, sort by queue position (convert to number for proper sorting)
+      const aPos = parseInt(a.queuePosition) || 0;
+      const bPos = parseInt(b.queuePosition) || 0;
+
+      return aPos - bPos;
+    });
+
+    // Get user's transaction history with pagination (latest first)
+    const transactionHistory = await Transaction.find({
+      user: req.user._id,
+    })
+      .populate("subscription", "plan status imei deviceName")
+      .populate("device", "deviceName imei")
+      .populate("processedBy", "username email")
+      .sort({ createdAt: -1 }) // Latest transactions first
+      .limit(50) // Limit to last 50 transactions to avoid large responses
+      .select("-metadata.userAgent -metadata.ipAddress"); // Exclude sensitive metadata
+
+    // Get transaction summary statistics
+    const transactionStats = await Transaction.aggregate([
+      { $match: { user: req.user._id } },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    // Calculate total spent and transaction counts
+    const totalSpent = await Transaction.aggregate([
+      {
+        $match: {
+          user: req.user._id,
+          status: "COMPLETED",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalAmount: { $sum: "$amount" },
+          completedTransactions: { $sum: 1 },
+        },
+      },
+    ]);
+
+    // Convert Mongoose document to plain object
+    user = user.toObject();
+
+    // Attach related data with sorted subscriptions
+    user.devices = devices;
+    user.subscriptions = sortedSubscriptions; // Use sorted subscriptions
     user.transactionHistory = transactionHistory;
     user.transactionStats = transactionStats;
     user.totalSpent = totalSpent[0]?.totalAmount || 0;
