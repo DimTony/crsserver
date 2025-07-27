@@ -2693,6 +2693,33 @@ const getRenewalHistory = async (req, res, next) => {
   }
 };
 
+const checkActiveSubscriptionStatus = async (req, res, next) => {
+  try {
+    const userId = req.user._id.toString();
+
+    const activeSubscriptions = await Subscription.find({
+      user: userId,
+      status: "ACTIVE",
+    }).select("plan imei deviceName startDate endDate");
+
+    const hasActive = activeSubscriptions.length > 0;
+
+    res.json({
+      success: true,
+      data: {
+        hasActiveSubscription: hasActive,
+        activeCount: activeSubscriptions.length,
+        activeSubscriptions: activeSubscriptions,
+        message: hasActive
+          ? `User has ${activeSubscriptions.length} active subscription(s)`
+          : "User has no active subscriptions",
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // models/subscription.js - Add this to the existing subscription schema
 
 // Add these fields to the SubscriptionSchema:
@@ -2763,7 +2790,7 @@ module.exports = {
   getDeviceSubscriptionSummary,
   addSubscriptionToExistingDevice,
   getUserDevices,
-
+  checkActiveSubscriptionStatus,
   renewActiveSubscription,
   getRenewalOptions,
   getRenewalHistory,

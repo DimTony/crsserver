@@ -65,7 +65,7 @@ const fetchIpInfo = async (ip) => {
   }
 };
 
-const checkEncryption = async (req, res, next) => {
+const checkEncryptionByIP = async (req, res, next) => {
   console.log("[checkEncryption SERVER]:", req.body);
   const { ip } = req.body;
 
@@ -86,7 +86,7 @@ const checkEncryption = async (req, res, next) => {
     // Validation checks
 
     if (ipRecord) {
-      console.log('PPPP', ipRecord)
+      console.log("PPPP", ipRecord);
       ipRecord.accessCount += 1;
       ipRecord.lastAccessed = Date.now();
       await ipRecord.save();
@@ -162,6 +162,83 @@ const checkEncryption = async (req, res, next) => {
         new CustomError(
           500,
           "Registration failed due to server error. Please try again."
+        )
+      );
+    }
+  } finally {
+    // End session
+    await session.endSession();
+  }
+};
+
+const checkEncryptionByIMEI = async (req, res, next) => {
+  console.log("[checkEncryptionByIMEI SERVER]:", req.body);
+  console.log("[checkEncryptionByIMEI SERVER]:", req.user);
+  const { imei } = req.body;
+
+  // Extract request metadata for transaction logging
+  // const requestMetadata = extractRequestMetadata(req);
+
+  // Start a database session for transaction
+  const session = await mongoose.startSession();
+
+  try {
+    // Input validation
+    if (!imei) {
+      throw new CustomError(400, "Please provide all required fields");
+    }
+
+    const device = await Device.findOne({
+      user: req.user._id,
+      imei,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Device scanned successfully",
+      data: {
+       
+
+        isOnboarded: device?.isOnboarded || false,
+        deviceExists: !!device,
+      },
+    });
+  } catch (err) {
+    // Abort transaction on any error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log("❌ Transaction aborted due to error");
+    }
+
+    console.error("checkEncryptionByIMEI error:", err);
+
+    if (err instanceof CustomError) {
+      next(err);
+    } else if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
+      next(new CustomError(400, `${field} already exists`));
+    } else if (err.name === "ValidationError") {
+      const messages = Object.values(err.errors).map((e) => e.message);
+      next(new CustomError(400, messages.join(", ")));
+    } else if (err.name === "MongoNetworkError") {
+      next(
+        new CustomError(
+          500,
+          "Database connection failed. Please try again later."
+        )
+      );
+    } else if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT") {
+      next(
+        new CustomError(
+          500,
+          "Network error. Please check your connection and try again."
+        )
+      );
+    } else {
+      next(
+        new CustomError(
+          500,
+          "checkEncryptionByIMEI failed due to server error. Please try again."
         )
       );
     }
@@ -388,7 +465,8 @@ const getUser = async (req, res, next) => {
 };
 
 module.exports = {
-  checkEncryption,
+  checkEncryptionByIMEI,
+  checkEncryptionByIP,
   login,
   getUser,
 };

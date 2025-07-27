@@ -1,13 +1,13 @@
 const express = require("express");
 const router = express.Router();
 const { auth } = require("../middleware/auth");
-const { checkEncryption } = require("../controllers/ipController");
+const { checkEncryptionByIMEI } = require("../controllers/ipController");
 const { cloudinaryUploadMiddleware } = require("../config/fileHandler");
 
 // All routes require authentication
 router.use(auth);
 
 // Device management
-router.post("/check-encryption", checkEncryption);
+router.post("/check-encryption", checkEncryptionByIMEI);
 
 module.exports = router;

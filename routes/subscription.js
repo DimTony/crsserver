@@ -17,6 +17,7 @@ const {
   newSubscription,
   addDeviceSubscription,
   addSubscriptionToMyDevice,
+  checkActiveSubscriptionStatus,
 } = require("../controllers/subscriptionController");
 const { cloudinaryUploadMiddleware } = require("../config/fileHandler");
 
@@ -34,6 +35,7 @@ router.post("/new", cloudinaryUploadMiddleware, addSubscriptionToMyDevice);
 
 // Subscription renewal endpoints
 router.get("/:id/renewal-options", getRenewalOptions);
+router.get("/active-status", checkActiveSubscriptionStatus);
 router.post("/:id/renew", renewActiveSubscription);
 router.get("/:id/renewal-history", getRenewalHistory);
 
